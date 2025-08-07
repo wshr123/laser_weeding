@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from scipy.spatial.distance import cdist
 from scipy.optimize import linear_sum_assignment
-import torch
+from ultralytics import YOLO, RTDETR
 import time
 import rospy
 from collections import defaultdict, deque
@@ -12,12 +12,6 @@ class WeedTracker:
     def __init__(self, max_distance=50, max_frames_to_skip=15, min_hits=3, iou_threshold=0.3):
         """
         初始化杂草跟踪器
-
-        Args:
-            max_distance: 最大匹配距离
-            max_frames_to_skip: 轨迹保持的最大跳帧数
-            min_hits: 轨迹稳定的最小命中次数
-            iou_threshold: IoU重叠阈值
         """
         self.tracks = {}
         self.next_id = 0
@@ -27,16 +21,13 @@ class WeedTracker:
         self.iou_threshold = iou_threshold
         self.confidence_history_length = 10
 
-        # 用于减少ID重复分配的参数
-        self.recently_deleted_tracks = {}  # 记录最近删除的轨迹
-        self.deletion_memory_time = 5.0  # 记住删除轨迹的时间（秒）
-        self.position_tolerance = 80  # 位置容忍度
-        self.size_tolerance = 0.5  # 尺寸容忍度
+        self.recently_deleted_tracks = {}
+        self.deletion_memory_time = 5.0
+        self.position_tolerance = 80
+        self.size_tolerance = 0.5
 
-        # 轨迹质量评估
-        self.quality_threshold = 0.4  # 轨迹质量阈值
+        self.quality_threshold = 0.4
 
-        # 统计信息
         self.total_tracks_created = 0
         self.total_tracks_recovered = 0
 
@@ -44,15 +35,15 @@ class WeedTracker:
         """创建卡尔曼滤波器用于位置预测"""
         kf = cv2.KalmanFilter(4, 2)  # 4个状态量(x,y,vx,vy), 2个观测量(x,y)
 
-        # 测量矩阵
+        # 测量矩阵 - 确保是float32类型
         kf.measurementMatrix = np.array([[1, 0, 0, 0],
-                                         [0, 1, 0, 0]], np.float32)
+                                         [0, 1, 0, 0]], dtype=np.float32)
 
         # 状态转移矩阵
         kf.transitionMatrix = np.array([[1, 0, 1, 0],
                                         [0, 1, 0, 1],
                                         [0, 0, 1, 0],
-                                        [0, 0, 0, 1]], np.float32)
+                                        [0, 0, 0, 1]], dtype=np.float32)
 
         # 过程噪声协方差
         kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
@@ -63,8 +54,8 @@ class WeedTracker:
         # 后验误差协方差
         kf.errorCovPost = np.eye(4, dtype=np.float32)
 
-        # 初始状态
-        kf.statePost = np.array([x, y, 0, 0], dtype=np.float32)
+        # 初始状态 - 确保是float32类型
+        kf.statePost = np.array([float(x), float(y), 0.0, 0.0], dtype=np.float32).reshape(4, 1)
 
         return kf
 
@@ -76,7 +67,6 @@ class WeedTracker:
         x1_2, y1_2, w2, h2 = box2
         x2_2, y2_2 = x1_2 + w2, y1_2 + h2
 
-        # 计算交集
         xi1 = max(x1_1, x1_2)
         yi1 = max(y1_1, y1_2)
         xi2 = min(x2_1, x2_2)
@@ -107,25 +97,20 @@ class WeedTracker:
         return ratio
 
     def should_create_new_track(self, new_bbox, new_centroid, confidence):
-        """检查是否应该创建新轨迹（改进版）"""
+        """检查是否应该创建新轨迹"""
         current_time = time.time()
 
-        # 检查与现有轨迹的重叠
         for track_id, track in self.tracks.items():
-            # IoU检查
             if self.calculate_iou(new_bbox, track['bbox']) > self.iou_threshold:
                 return False
 
-            # 距离检查
             dist = np.linalg.norm(new_centroid - track['predicted_centroid'])
             adaptive_threshold = self.max_distance * (1 + track['frames_skipped'] * 0.1)
 
             if dist < adaptive_threshold:
                 return False
 
-        # 检查与最近删除的轨迹的重叠
         for deleted_id, deleted_info in list(self.recently_deleted_tracks.items()):
-            # 清理过期的删除记录
             if current_time - deleted_info['deletion_time'] > self.deletion_memory_time:
                 del self.recently_deleted_tracks[deleted_id]
                 continue
@@ -133,15 +118,13 @@ class WeedTracker:
             deleted_centroid = deleted_info['last_centroid']
             deleted_bbox = deleted_info['last_bbox']
 
-            # 位置相似度检查
             dist = np.linalg.norm(new_centroid - deleted_centroid)
             size_sim = self.calculate_size_similarity(new_bbox, deleted_bbox)
 
             if (dist < self.position_tolerance and
                     size_sim > self.size_tolerance and
                     confidence > 0.3):
-                # 可能是同一个杂草，恢复原来的ID
-                rospy.loginfo(f"Recovering deleted track {deleted_id} (dist: {dist:.1f}, size_sim: {size_sim:.2f})")
+                rospy.loginfo(f"Recovering deleted track {deleted_id}")
                 self.recover_deleted_track(deleted_id, deleted_info, new_bbox, new_centroid, confidence)
                 return False
 
@@ -149,12 +132,10 @@ class WeedTracker:
 
     def recover_deleted_track(self, track_id, deleted_info, new_bbox, new_centroid, confidence):
         """恢复被删除的轨迹"""
-        # 重新创建卡尔曼滤波器
         kf = self.create_kalman_filter(new_centroid[0], new_centroid[1])
 
-        # 继承之前的置信度历史
         prev_confidence_history = deleted_info.get('confidence_history', [])
-        new_confidence_history = prev_confidence_history[-5:] + [confidence]  # 保留最近5个历史值
+        new_confidence_history = prev_confidence_history[-5:] + [confidence]
 
         self.tracks[track_id] = {
             'kalman': kf,
@@ -172,10 +153,8 @@ class WeedTracker:
             'quality_score': self.calculate_track_quality(new_confidence_history, 1)
         }
 
-        # 从删除记录中移除
         del self.recently_deleted_tracks[track_id]
 
-        # 确保next_id不会重复使用已恢复的ID
         if track_id >= self.next_id:
             self.next_id = track_id + 1
 
@@ -198,7 +177,6 @@ class WeedTracker:
         if track_id in self.tracks:
             track = self.tracks[track_id]
 
-            # 只记录质量较好的轨迹，避免记录太多噪声轨迹
             if track.get('quality_score', 0) > 0.3 or track.get('consecutive_hits', 0) >= 2:
                 self.recently_deleted_tracks[track_id] = {
                     'deletion_time': time.time(),
@@ -262,8 +240,10 @@ class WeedTracker:
         # 预测所有现有轨迹的位置
         for track_id in list(self.tracks.keys()):
             track = self.tracks[track_id]
+            # 预测返回的是4x1矩阵，需要正确提取
             predicted = track['kalman'].predict()
-            track['predicted_centroid'] = predicted[:2].flatten()
+            # 确保predicted_centroid是一维数组
+            track['predicted_centroid'] = np.array([predicted[0, 0], predicted[1, 0]], dtype=np.float32)
 
         if len(detections_with_conf) == 0:
             # 没有新检测，只更新现有轨迹状态
@@ -275,7 +255,6 @@ class WeedTracker:
                 if track['frames_skipped'] > self.max_frames_to_skip:
                     self.delete_track(track_id)
 
-            # 返回可靠的轨迹
             return [(track_id, self.get_predicted_bbox(track), track.get('avg_confidence', 0))
                     for track_id, track in self.tracks.items()
                     if self.is_reliable_track(track_id) or track['frames_skipped'] <= 3]
@@ -284,14 +263,14 @@ class WeedTracker:
         detections = [det[0] for det in detections_with_conf]
         confidences = [det[1] for det in detections_with_conf]
 
-        # 计算检测框的质心
+        # 计算检测框的质心 - 确保是float32类型
         detection_centroids = np.array([[bbox[0] + bbox[2] / 2, bbox[1] + bbox[3] / 2]
-                                        for bbox in detections])
+                                        for bbox in detections], dtype=np.float32)
 
         if len(self.tracks) == 0:
             # 第一帧或无现有轨迹，创建新轨迹
             for i, bbox in enumerate(detections):
-                if confidences[i] > 0.3:  # 只为高置信度检测创建轨迹
+                if confidences[i] > 0.3:
                     centroid = detection_centroids[i]
                     kf = self.create_kalman_filter(centroid[0], centroid[1])
 
@@ -313,32 +292,29 @@ class WeedTracker:
         else:
             # 计算预测位置与检测位置的距离矩阵
             predicted_centroids = np.array([track['predicted_centroid']
-                                            for track in self.tracks.values()])
+                                            for track in self.tracks.values()], dtype=np.float32)
             track_ids = list(self.tracks.keys())
 
             if len(predicted_centroids) > 0 and len(detection_centroids) > 0:
                 # 计算距离矩阵
                 distances = cdist(predicted_centroids, detection_centroids)
 
-                # 创建成本矩阵（结合距离和IoU）
+                # 创建成本矩阵
                 cost_matrix = distances.copy()
 
                 for i, track_id in enumerate(track_ids):
                     track = self.tracks[track_id]
                     for j, detection in enumerate(detections):
-                        # 结合距离和IoU计算成本
                         distance_cost = distances[i, j]
                         iou = self.calculate_iou(track['bbox'], detection)
                         size_sim = self.calculate_size_similarity(track['bbox'], detection)
 
-                        # 综合成本：距离成本 - IoU奖励 - 尺寸相似度奖励
                         combined_cost = distance_cost - iou * 50 - size_sim * 20
 
-                        # 动态调整距离阈值
                         adaptive_threshold = self.max_distance * (1 + track['frames_skipped'] * 0.2)
 
                         if distance_cost > adaptive_threshold * 2:
-                            combined_cost = 1e6  # 距离太远的设为很大值
+                            combined_cost = 1e6
 
                         cost_matrix[i, j] = combined_cost
 
@@ -350,11 +326,10 @@ class WeedTracker:
 
                     # 处理匹配结果
                     for row_idx, col_idx in zip(row_indices, col_indices):
-                        if cost_matrix[row_idx, col_idx] < 1e6:  # 有效匹配
+                        if cost_matrix[row_idx, col_idx] < 1e6:
                             track_id = track_ids[row_idx]
                             distance = distances[row_idx, col_idx]
 
-                            # 动态调整距离阈值
                             adaptive_threshold = self.max_distance * (1 + self.tracks[track_id]['frames_skipped'] * 0.2)
 
                             if distance < adaptive_threshold:
@@ -362,18 +337,18 @@ class WeedTracker:
                                 track = self.tracks[track_id]
                                 centroid = detection_centroids[col_idx]
 
-                                # 更新卡尔曼滤波器
-                                track['kalman'].correct(centroid.reshape(2, 1))
+                                # 更新卡尔曼滤波器 - 确保输入是float32类型的2x1矩阵
+                                measurement = np.array([[centroid[0]], [centroid[1]]], dtype=np.float32)
+                                track['kalman'].correct(measurement)
+
                                 track['centroid'] = centroid.copy()
                                 track['bbox'] = detections[col_idx].copy()
                                 track['frames_skipped'] = 0
                                 track['consecutive_hits'] += 1
                                 track['total_hits'] = track.get('total_hits', 0) + 1
 
-                                # 更新置信度
                                 self.update_track_confidence(track_id, confidences[col_idx])
 
-                                # 标记为已恢复的轨迹在一段时间后重置recovered标志
                                 if (track.get('recovered', False) and
                                         current_time - track.get('recovery_time', 0) > 2.0):
                                     track['recovered'] = False
@@ -394,11 +369,10 @@ class WeedTracker:
                     # 创建新轨迹
                     for i, bbox in enumerate(detections):
                         if (i not in used_detection_indices and
-                                confidences[i] > 0.3):  # 只为高置信度检测创建轨迹
+                                confidences[i] > 0.3):
 
                             centroid = detection_centroids[i]
 
-                            # 检查是否应该创建新轨迹
                             if self.should_create_new_track(bbox, centroid, confidences[i]):
                                 kf = self.create_kalman_filter(centroid[0], centroid[1])
 
@@ -421,7 +395,6 @@ class WeedTracker:
         # 返回稳定的轨迹
         stable_tracks = []
         for track_id, track in self.tracks.items():
-            # 返回可靠的轨迹或刚刚更新的轨迹
             if self.is_reliable_track(track_id) or track['frames_skipped'] <= 2:
                 if track['frames_skipped'] == 0:
                     bbox = track['bbox']
@@ -443,61 +416,62 @@ class WeedTracker:
         }
 
 
+# WeedDetector类保持不变，只展示相关部分确保兼容性
 class WeedDetector:
-    def __init__(self, model_path, yolo5_weed_id=1, confidence_threshold=0.3):
+    def __init__(self, model_path, model_type='yolov8', weed_class_id=0,
+                 crop_class_id=1, confidence_threshold=0.3, device='cuda:0'):
         """
-        初始化杂草检测器
-
-        Args:
-            model_path: YOLO模型路径
-            yolo5_weed_id: 杂草类别ID
-            confidence_threshold: 检测置信度阈值
+        初始化杂草检测器，支持多种模型
         """
-        try:
-            # 加载YOLO模型
-            self.model = torch.hub.load('ultralytics/yolov5', 'custom', path=model_path)
-            self.model.conf = confidence_threshold  # 设置置信度阈值
-            rospy.loginfo(f"Successfully loaded YOLO model from {model_path}")
-        except Exception as e:
-            rospy.logerr(f"Failed to load YOLO model: {e}")
-            raise
-
-        self.yolo5_weed_id = yolo5_weed_id
+        self.model_type = model_type.lower()
+        self.weed_class_id = weed_class_id
+        self.crop_class_id = crop_class_id
         self.confidence_threshold = confidence_threshold
+        self.device = device
+
+        try:
+            if self.model_type in ['yolov8', 'yolov11']:
+                self.model = YOLO(model_path)
+                rospy.loginfo(f"Successfully loaded {self.model_type.upper()} model from {model_path}")
+            elif self.model_type == 'rtdetr':
+                self.model = RTDETR(model_path)
+                rospy.loginfo(f"Successfully loaded RT-DETR model from {model_path}")
+            else:
+                raise ValueError(f"Unsupported model type: {self.model_type}")
+
+            self.model.to(device)
+
+        except Exception as e:
+            rospy.logerr(f"Failed to load {self.model_type} model: {e}")
+            raise
 
         # 初始化跟踪器
         self.weed_tracker = WeedTracker(
-            max_distance=80,  # 最大匹配距离
-            max_frames_to_skip=20,  # 最大跳帧数
-            min_hits=3,  # 最小命中次数
-            iou_threshold=0.2  # IoU阈值
+            max_distance=80,
+            max_frames_to_skip=20,
+            min_hits=3,
+            iou_threshold=0.2
         )
 
-        # 检测结果缓存和平滑
         self.detection_history = deque(maxlen=5)
         self.frame_count = 0
 
-        # 检测统计
         self.detection_stats = {
             'total_detections': 0,
             'total_frames': 0,
-            'avg_detections_per_frame': 0
+            'avg_detections_per_frame': 0,
+            'model_type': self.model_type
         }
 
-        # 图像处理参数
-        self.input_size = (640, 640)  # YOLO输入尺寸
+        self.input_size = (640, 640)
 
-        rospy.loginfo("WeedDetector initialized successfully")
+        rospy.loginfo(f"WeedDetector initialized with {self.model_type.upper()} model")
 
+    # 其余方法保持不变...
     def preprocess_image(self, image):
         """预处理图像"""
-        # 图像增强（可选）
         enhanced_image = cv2.convertScaleAbs(image, alpha=1.1, beta=10)
-
-        # 转换为RGB
-        image_rgb = cv2.cvtColor(enhanced_image, cv2.COLOR_BGR2RGB)
-
-        return image_rgb
+        return enhanced_image
 
     def filter_detections(self, detections, image_shape):
         """过滤检测结果"""
@@ -508,18 +482,15 @@ class WeedDetector:
             bbox, conf = detection
             x, y, width, height = bbox
 
-            # 边界检查
             if (x < 0 or y < 0 or x + width > w or y + height > h):
                 continue
 
-            # 尺寸检查（过滤过小或过大的检测）
             area = width * height
-            if area < 100 or area > w * h * 0.5:  # 面积在100到图像一半之间
+            if area < 100 or area > w * h * 0.5:
                 continue
 
-            # 宽高比检查
             aspect_ratio = width / height if height > 0 else 0
-            if aspect_ratio < 0.2 or aspect_ratio > 5.0:  # 宽高比在合理范围内
+            if aspect_ratio < 0.2 or aspect_ratio > 5.0:
                 continue
 
             filtered_detections.append(detection)
@@ -530,58 +501,55 @@ class WeedDetector:
         """检测结果时间平滑"""
         if len(self.detection_history) < 2:
             return current_detections
-
-        # 简单的时间一致性检查
-        # 这里可以实现更复杂的平滑算法
         return current_detections
 
     def detect_plants_and_weeds(self, np_image):
-        """
-        检测植物和杂草
+        """检测植物和杂草"""
+        processed_image = self.preprocess_image(np_image)
 
-        Args:
-            np_image: 输入图像 (BGR格式)
-
-        Returns:
-            plant_detections: 植物检测结果
-            weed_detections: 杂草检测结果
-        """
-        # 预处理图像
-        image_rgb = self.preprocess_image(np_image)
-
-        # YOLO检测
         try:
-            results = self.model(image_rgb)
-            bboxes = results.xyxy[0].cpu().numpy()
+            results = self.model(processed_image, conf=self.confidence_threshold, device=self.device)
+
+            if len(results) > 0 and results[0].boxes is not None:
+                boxes = results[0].boxes
+                bboxes_xyxy = boxes.xyxy.cpu().numpy()
+                confidences = boxes.conf.cpu().numpy()
+                classes = boxes.cls.cpu().numpy()
+            else:
+                bboxes_xyxy = np.array([])
+                confidences = np.array([])
+                classes = np.array([])
+
         except Exception as e:
-            rospy.logerr(f"YOLO detection failed: {e}")
+            rospy.logerr(f"{self.model_type.upper()} detection failed: {e}")
             return [], []
 
         plant_detections = []
         weed_detections = []
 
-        for bbox in bboxes:
-            x1, y1, x2, y2, conf, cls = bbox
+        for i in range(len(bboxes_xyxy)):
+            x1, y1, x2, y2 = bboxes_xyxy[i]
+            conf = float(confidences[i])  # 确保是Python float
+            cls = int(classes[i])
 
-            # 转换为 [x, y, w, h] 格式
-            bbox_xywh = [x1, y1, x2 - x1, y2 - y1]
+            # 转换为 [x, y, w, h] 格式，确保是float类型
+            bbox_xywh = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+            width, height = x2 - x1, y2 - y1
+            if width < 100 and height < 100:
+                plant_detections.append((bbox_xywh, conf))
+            weed_detections.append((bbox_xywh, conf))
 
-            # 处理作物检测 (假设class 0是作物)
-            if int(cls) == 0 and conf > 0.4:
-                # 额外的作物过滤条件
-                width, height = x2 - x1, y2 - y1
-                if width < 50 and height < 50:  # 作物通常较小
-                    plant_detections.append((bbox_xywh, conf))
+            # if cls == self.crop_class_id and conf > 0.4:
+            #     width, height = x2 - x1, y2 - y1
+            #     if width < 100 and height < 100:
+            #         plant_detections.append((bbox_xywh, conf))
+            #
+            # elif cls == self.weed_class_id and conf > self.confidence_threshold:
+            #     weed_detections.append((bbox_xywh, conf))
 
-            # 处理杂草检测
-            elif int(cls) == self.yolo5_weed_id and conf > self.confidence_threshold:
-                weed_detections.append((bbox_xywh, conf))
-
-        # 过滤检测结果
         weed_detections = self.filter_detections(weed_detections, np_image.shape)
         plant_detections = self.filter_detections(plant_detections, np_image.shape)
 
-        # 更新统计信息
         self.detection_stats['total_detections'] += len(weed_detections)
         self.detection_stats['total_frames'] += 1
         self.detection_stats['avg_detections_per_frame'] = (
@@ -591,44 +559,26 @@ class WeedDetector:
         return plant_detections, weed_detections
 
     def detect_and_track_weeds(self, np_image):
-        """
-        检测并跟踪杂草（主要接口）
-
-        Args:
-            np_image: 输入图像 (BGR格式)
-
-        Returns:
-            result_image: 带有检测和跟踪结果的图像
-            tracked_weeds: 跟踪结果 [(track_id, bbox, confidence), ...]
-        """
+        """检测并跟踪杂草"""
         self.frame_count += 1
         det_image = np_image.copy()
 
-        # 初始化分割图像和中心点列表
-        h, w = np_image.shape[:2]
-        self.image_seg_bn = np.zeros((h, w), dtype=np.uint8)
         self.ctr_points = []
 
-        # 检测植物和杂草
         plant_detections, weed_detections = self.detect_plants_and_weeds(np_image)
 
-        # 将检测结果添加到历史记录
         self.detection_history.append(weed_detections)
 
-        # 平滑检测结果
         smoothed_detections = self.smooth_detections(weed_detections)
 
-        # 更新跟踪器
         tracked_weeds = self.weed_tracker.update(smoothed_detections)
 
-        # 计算中心点（用于兼容性）
         for _, bbox, _ in tracked_weeds:
             x, y, w, h = bbox
             center_x = x + w / 2
             center_y = y + h / 2
             self.ctr_points.append([center_x, center_y])
 
-        # 绘制检测和跟踪结果
         det_image = self.draw_results(det_image, plant_detections, tracked_weeds)
 
         return det_image, tracked_weeds
@@ -637,80 +587,68 @@ class WeedDetector:
         """绘制检测和跟踪结果"""
         result_image = image.copy()
 
-        # 绘制作物检测结果
         for plant_det, conf in plant_detections:
             x, y, w, h = plant_det
             cv2.rectangle(result_image, (int(x), int(y)), (int(x + w), int(y + h)),
-                          (255, 255, 255), 2)  # 白色框表示作物
+                          (255, 255, 255), 2)
 
-            # 添加标签
             label = f'Plant ({conf:.2f})'
             cv2.putText(result_image, label, (int(x), int(y - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
 
-        # 绘制杂草跟踪结果
         for track_id, bbox, avg_conf in tracked_weeds:
             x, y, w, h = bbox
 
-            # 根据轨迹状态选择颜色和样式
             track_info = self.weed_tracker.tracks.get(track_id, {})
 
             if track_info.get('recovered', False):
-                color = (0, 255, 0)  # 绿色表示恢复的轨迹
+                color = (0, 255, 0)
                 thickness = 3
                 line_type = cv2.LINE_4
             elif self.weed_tracker.is_reliable_track(track_id):
-                color = (0, 255, 255)  # 黄色表示稳定轨迹
+                color = (0, 255, 255)
                 thickness = 2
                 line_type = cv2.LINE_8
             else:
-                color = (255, 0, 0)  # 蓝色表示新轨迹
+                color = (255, 0, 0)
                 thickness = 2
                 line_type = cv2.LINE_8
 
-            # 绘制边界框
             cv2.rectangle(result_image, (int(x), int(y)), (int(x + w), int(y + h)),
                           color, thickness, line_type)
 
-            # 绘制中心点
             center_x = int(x + w / 2)
             center_y = int(y + h / 2)
             cv2.circle(result_image, (center_x, center_y), 3, color, -1)
 
-            # 准备标签信息
             label_parts = [f'W_{track_id}']
             label_parts.append(f'({avg_conf:.2f})')
 
-            # 添加状态标记
             if track_info.get('recovered', False):
-                label_parts.append('[R]')  # 恢复标记
+                label_parts.append('[R]')
 
             consecutive_hits = track_info.get('consecutive_hits', 0)
             if consecutive_hits >= self.weed_tracker.min_hits:
-                label_parts.append(f'[H{consecutive_hits}]')  # 命中次数
+                label_parts.append(f'[H{consecutive_hits}]')
 
             quality_score = track_info.get('quality_score', 0)
             if quality_score > 0:
-                label_parts.append(f'[Q{quality_score:.1f}]')  # 质量分数
+                label_parts.append(f'[Q{quality_score:.1f}]')
 
             label = ' '.join(label_parts)
 
-            # 计算标签尺寸和位置
             label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
             label_y = int(y - 5) if y > 30 else int(y + h + 20)
 
-            # 绘制标签背景
             cv2.rectangle(result_image,
                           (int(x), label_y - label_size[1] - 5),
                           (int(x + label_size[0] + 5), label_y + 5),
                           color, -1)
 
-            # 绘制标签文字
             text_color = (0, 0, 0) if color == (0, 255, 255) else (255, 255, 255)
             cv2.putText(result_image, label, (int(x + 2), label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
 
-        # 绘制统计信息
         self.draw_statistics(result_image)
 
         return result_image
@@ -720,9 +658,9 @@ class WeedDetector:
         stats = self.weed_tracker.get_statistics()
         detection_stats = self.detection_stats
 
-        # 统计信息文本
         info_lines = [
-            f"Frame: {self.frame_count}",
+            # f"Model: {self.model_type.upper()}",
+            # f"Frame: {self.frame_count}",
             f"Active Tracks: {stats['active_tracks']}",
             f"Reliable: {stats['reliable_tracks']}",
             f"Total Created: {stats['total_created']}",
@@ -730,19 +668,17 @@ class WeedDetector:
             f"Avg Det/Frame: {detection_stats['avg_detections_per_frame']:.1f}"
         ]
 
-        # 绘制信息框背景
-        box_height = len(info_lines) * 25 + 10
-        cv2.rectangle(image, (10, 10), (300, box_height), (0, 0, 0), -1)
-        cv2.rectangle(image, (10, 10), (300, box_height), (255, 255, 255), 2)
+        box_height = len(info_lines) * 15 + 10
+        cv2.rectangle(image, (10, 10), (150, box_height), (0, 0, 0), -1)
+        cv2.rectangle(image, (10, 10), (150, box_height), (255, 255, 255), 2)
 
-        # 绘制信息文本
         for i, line in enumerate(info_lines):
             y_pos = 30 + i * 25
             cv2.putText(image, line, (15, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     def get_track_info(self):
-        """获取当前跟踪信息（兼容接口）"""
+        """获取当前跟踪信息"""
         track_info = {}
         for track_id, track in self.weed_tracker.tracks.items():
             track_info[track_id] = {
@@ -771,7 +707,6 @@ class WeedDetector:
                     'quality_score': track.get('quality_score', 0)
                 })
 
-        # 按ID排序
         reliable_weeds.sort(key=lambda x: x['id'])
         return reliable_weeds
 
@@ -785,7 +720,7 @@ class WeedDetector:
         )
         self.detection_history.clear()
         self.frame_count = 0
-        rospy.loginfo("Weed tracker reset")
+        rospy.loginfo(f"Weed tracker reset for {self.model_type.upper()} detector")
 
     def get_statistics(self):
         """获取完整统计信息"""
@@ -793,5 +728,6 @@ class WeedDetector:
         return {
             'tracker': tracker_stats,
             'detection': self.detection_stats,
-            'frame_count': self.frame_count
+            'frame_count': self.frame_count,
+            'model_type': self.model_type
         }

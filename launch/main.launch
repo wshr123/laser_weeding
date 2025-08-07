@@ -1,14 +1,24 @@
 <launch>
     <!-- 如果使用真实摄像头，启动usb_cam节点 -->
     <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
-        <param name="video_device" value="/dev/video0" />
+        <param name="video_device" value="/dev/video4" />
         <param name="image_width" value="640" />
         <param name="image_height" value="480" />
         <param name="pixel_format" value="yuyv" />
         <param name="camera_frame_id" value="usb_cam" />
         <param name="io_method" value="mmap"/>
+        <remap from="usb_cam/image_raw" to="/camera/image_raw" />
     </node>
 
-    <!-- 启动weeding节点 -->
-    <node pkg="laser_weeding" type="weeding_node.py" name="weeding_node" output="screen" />
+    <node pkg="laser_weeding" type="main.py" name="weeding_node" output="screen" required="true" launch-prefix="">
+        <!-- 模型参数 -->
+        <param name="model_type" value="yolov11" />  <!-- 可选: yolov8, yolov11, rtdetr -->
+        <param name="model_path" value="/home/zhong/my_workspace/src/laser_weeding/weights/yolo11m.pt" />  <!-- 修改为您的模型路径 -->
+        <param name="device" value="0" />  <!-- 如果有GPU可以改为cuda:0 -->
+
+        <!-- 其他参数 -->
+        <param name="weed_class_id" value="0" />
+        <param name="crop_class_id" value="1" />
+        <param name="confidence_threshold" value="0.3" />
+    </node>
 </launch>
