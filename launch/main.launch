@@ -1,0 +1,14 @@
+<launch>
+    <!-- 如果使用真实摄像头，启动usb_cam节点 -->
+    <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
+        <param name="video_device" value="/dev/video0" />
+        <param name="image_width" value="640" />
+        <param name="image_height" value="480" />
+        <param name="pixel_format" value="yuyv" />
+        <param name="camera_frame_id" value="usb_cam" />
+        <param name="io_method" value="mmap"/>
+    </node>
+
+    <!-- 启动weeding节点 -->
+    <node pkg="laser_weeding" type="weeding_node.py" name="weeding_node" output="screen" />
+</launch>
