@@ -1,5 +1,5 @@
 <launch>
-    <!-- 如果使用真实摄像头，启动usb_cam节点 -->
+<!--     USB摄像头节点 -->
     <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
         <param name="video_device" value="/dev/video4" />
         <param name="image_width" value="640" />
@@ -10,15 +10,41 @@
         <remap from="usb_cam/image_raw" to="/camera/image_raw" />
     </node>
 
-    <node pkg="laser_weeding" type="main.py" name="weeding_node" output="screen" required="true" launch-prefix="">
-        <!-- 模型参数 -->
-        <param name="model_type" value="yolov11" />  <!-- 可选: yolov8, yolov11, rtdetr -->
-        <param name="model_path" value="/home/zhong/my_workspace/src/laser_weeding/weights/yolo11m.pt" />  <!-- 修改为您的模型路径 -->
-        <param name="device" value="0" />  <!-- 如果有GPU可以改为cuda:0 -->
+<!--     激光除草节点 -->
+    <node pkg="laser_weeding" type="main.py" name="weeding_node" output="screen" required="true">
+<!--         模型参数 -->
+        <param name="model_type" value="yolov11" />
+        <param name="model_path" value="/home/zhong/my_workspace/src/laser_weeding/weights/yolo11m.pt" />
+        <param name="device" value="0" />
 
-        <!-- 其他参数 -->
+<!--         跟踪器参数 -->
+        <param name="tracker_type" value="botsort" />  可选: custom, bytetrack, botsort
+        <param name="tracker_config" value="$(find laser_weeding)/config/tracker_config.yaml" />
+
+<!--         类别ID -->
         <param name="weed_class_id" value="0" />
         <param name="crop_class_id" value="1" />
-        <param name="confidence_threshold" value="0.3" />
+        <param name="confidence_threshold" value="0.1" />
+
+<!--         串口参数 -->
+        <param name="serial_port" value="/dev/ttyACM0" />
+        <param name="serial_baudrate" value="115200" />
+
+        <!--激光参数 -->
+        <param name="laser_duration" value="0.1" />
+        <!-- 振镜控制参数 -->
+        <param name="galvo_smooth" value="true" />        <!-- 是否启用平滑移动 -->
+        <param name="stabilization_delay" value="0.05" /> <!-- 振镜稳定延时(秒) -->
+
+        <!-- 校准参数 -->
+        <param name="galvo_x_offset" value="0" />         <!-- X轴偏移校准 -->
+        <param name="galvo_y_offset" value="0" />         <!-- Y轴偏移校准 -->
+        <param name="galvo_x_scale" value="1.0" />        <!-- X轴缩放校准 -->
+        <param name="galvo_y_scale" value="1.0" />        <!-- Y轴缩放校准 -->
+
+        <!-- 安全参数 -->
+        <param name="max_laser_duration" value="0.5" />   <!-- 最大激光持续时间 -->
+        <param name="safe_mode" value="true" />           <!-- 安全模式开关 -->
     </node>
 </launch>
+

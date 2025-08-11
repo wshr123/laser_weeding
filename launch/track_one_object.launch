@@ -1,0 +1,43 @@
+<launch>
+    <!-- USB摄像头节点 -->
+    <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
+        <param name="video_device" value="/dev/video4" />
+        <param name="image_width" value="640" />
+        <param name="image_height" value="480" />
+        <param name="pixel_format" value="yuyv" />
+        <param name="camera_frame_id" value="usb_cam" />
+        <param name="io_method" value="mmap"/>
+        <remap from="usb_cam/image_raw" to="/camera/image_raw" />
+    </node>
+
+    <!-- 最高置信度激光除草节点 -->
+    <node pkg="laser_weeding" type="track_one_object.py" name="highest_confidence_weeding_node" output="screen" required="true">
+        <!-- 模型参数 -->
+        <param name="model_type" value="yolov11" />
+        <param name="model_path" value="/home/zhong/my_workspace/src/laser_weeding/weights/yolo11m.pt" />
+        <param name="device" value="0" />
+
+        <!-- 跟踪器参数 custom, bytetrack, botsort -->
+        <param name="tracker_type" value="custom" />
+
+        <!-- 类别ID -->
+        <param name="weed_class_id" value="64" />
+        <param name="crop_class_id" value="0" />
+        <param name="confidence_threshold" value="0.3" />
+
+        <!-- 目标选择参数 -->
+        <param name="min_confidence" value="0.3" />          <!-- 最小置信度阈值 -->
+        <param name="target_stable_frames" value="5" />      <!-- 目标稳定帧数 -->
+
+        <!-- 串口参数 -->
+        <param name="serial_port" value="/dev/ttyACM0" />
+        <param name="serial_baudrate" value="115200" />
+
+        <!-- 激光参数 -->
+        <param name="laser_duration" value="0.1" />
+
+        <!-- 图像参数 -->
+        <param name="image_width" value="640" />
+        <param name="image_height" value="480" />
+    </node>
+</launch>
