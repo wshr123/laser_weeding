@@ -16,6 +16,9 @@ import json
 import time
 from collections import defaultdict
 
+# 导入振镜控制器
+from send_to_teensy import XY2_100Controller
+
 
 class LaserWeedingNode:
     def __init__(self):
@@ -28,18 +31,20 @@ class LaserWeedingNode:
             # Parameters
             self.bridge = CvBridge()
 
-            # Serial setup for Teensy - 添加错误处理
+            # 使用XY2_100Controller替代原有的串口控制
             serial_port_name = rospy.get_param('~serial_port', '/dev/ttyACM0')
             serial_baudrate = rospy.get_param('~serial_baudrate', 115200)
 
             try:
-                self.serial_port = serial.Serial(serial_port_name, serial_baudrate, timeout=1)
-                self.serial_port.flush()
-                rospy.loginfo(f"Serial port {serial_port_name} opened successfully")
-            except serial.SerialException as e:
-                rospy.logwarn(f"Failed to open serial port {serial_port_name}: {e}")
-                rospy.logwarn("Continuing without serial connection...")
-                self.serial_port = None
+                self.galvo_controller = XY2_100Controller(
+                    port=serial_port_name,
+                    baudrate=serial_baudrate
+                )
+                rospy.loginfo(f"Galvo controller initialized successfully")
+            except Exception as e:
+                rospy.logwarn(f"Failed to initialize galvo controller: {e}")
+                rospy.logwarn("Continuing without galvo connection...")
+                self.galvo_controller = None
 
             # 激光控制相关参数
             self.processed_weeds = set()
@@ -60,18 +65,9 @@ class LaserWeedingNode:
             self.device = rospy.get_param('~device', 'cpu')
             self.confidence_threshold = rospy.get_param('~confidence_threshold', 0.3)
 
-            # 检查模型路径
-            if not self.model_path:
-                rospy.logerr("Model path not specified! Please set the model_path parameter.")
-                rospy.logerr("Example: rosrun laser_weeding main.py _model_path:=/path/to/model.pt")
-                sys.exit(1)
-
-            if not os.path.exists(self.model_path):
-                rospy.logerr(f"Model file not found: {self.model_path}")
-                sys.exit(1)
-
-            rospy.loginfo(f"Loading {self.model_type} model from: {self.model_path}")
-            rospy.loginfo(f"Using device: {self.device}")
+            # 跟踪器配置
+            self.tracker_type = rospy.get_param('~tracker_type', 'custom')
+            self.tracker_config = rospy.get_param('~tracker_config', None)
 
             try:
                 self.detector = WeedDetector(
@@ -80,9 +76,12 @@ class LaserWeedingNode:
                     weed_class_id=self.weed_class_id,
                     crop_class_id=self.crop_class_id,
                     confidence_threshold=self.confidence_threshold,
-                    device=self.device
+                    device=self.device,
+                    tracker_type=self.tracker_type,
+                    tracker_config=self.tracker_config
                 )
-                rospy.loginfo(f'{self.model_type.upper()} detection model loaded successfully')
+                rospy.loginfo(
+                    f'{self.model_type.upper()} detection model with {self.tracker_type} tracker loaded successfully')
             except Exception as e:
                 rospy.logerr(f"Failed to load detection model: {e}")
                 rospy.logerr(traceback.format_exc())
@@ -91,7 +90,6 @@ class LaserWeedingNode:
             # Calibration parameters
             self.image_width = rospy.get_param('~image_width', 640)
             self.image_height = rospy.get_param('~image_height', 480)
-            self.xy_scale = 65535.0 / self.image_width
 
             # 初始化图像变量
             self.left_img = None
@@ -100,7 +98,7 @@ class LaserWeedingNode:
             self.xy_pub = rospy.Publisher('/laser_xy', Int32MultiArray, queue_size=10)
             self.det_img_pub = rospy.Publisher('/det_img/image_raw', Image, queue_size=2)
 
-            # Subscribers - 添加回调确认
+            # Subscribers
             image_topic = rospy.get_param('~image_topic', '/camera/image_raw')
             rospy.loginfo(f"Subscribing to image topic: {image_topic}")
 
@@ -120,11 +118,11 @@ class LaserWeedingNode:
 
             # 定时器用于激光控制
             self.laser_control_timer = rospy.Timer(
-                rospy.Duration(0.1),
+                rospy.Duration(0.05),  # 减少到50ms，提高响应速度
                 self.laser_control_callback
             )
 
-            # 添加心跳日志
+            # 心跳日志
             self.heartbeat_timer = rospy.Timer(
                 rospy.Duration(5.0),
                 self.heartbeat_callback
@@ -151,7 +149,6 @@ class LaserWeedingNode:
         """图像回调"""
         try:
             self.left_img = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            # 只在第一次接收到图像时打印
             if not hasattr(self, '_first_image_received'):
                 rospy.loginfo(f"First image received! Shape: {self.left_img.shape}")
                 self._first_image_received = True
@@ -262,6 +259,10 @@ class LaserWeedingNode:
         if not self.laser_active:
             self.start_laser_treatment(target_info)
         else:
+            # 检查是否需要更新振镜位置（跟踪移动的目标）
+            self.update_laser_position(target_info)
+
+            # 检查激光持续时间
             if time.time() - self.laser_start_time >= self.laser_duration:
                 self.complete_laser_treatment()
 
@@ -269,17 +270,42 @@ class LaserWeedingNode:
         """开始激光处理"""
         bbox = target_info['bbox']
         centroid = [(bbox[0] + bbox[2] / 2), (bbox[1] + bbox[3] / 2)]
-        x, y = self.calculate_xy(centroid)
+        galvo_x, galvo_y = self.pixel_to_galvo(centroid[0], centroid[1])
 
-        self.send_to_teensy(x, y)
+        # 使用galvo_controller移动到位置
+        if self.galvo_controller:
+            self.galvo_controller.move_to_position(galvo_x, galvo_y)
+            # 等待振镜稳定
+            rospy.sleep(0.05)
+            # 开启激光
+            self.galvo_controller.laser_on()
+
         self.laser_active = True
         self.laser_start_time = time.time()
 
+        # 发布消息（为了与原有系统兼容）
         xy_msg = Int32MultiArray()
-        xy_msg.data = [x, y, 1]
+        xy_msg.data = [galvo_x, galvo_y, 1]
         self.xy_pub.publish(xy_msg)
 
-        rospy.loginfo(f"Started laser treatment for weed {self.current_target_id} at ({x}, {y})")
+        rospy.loginfo(f"Started laser treatment for weed {self.current_target_id} at ({galvo_x}, {galvo_y})")
+
+    def update_laser_position(self, target_info):
+        """更新激光位置以跟踪移动的目标"""
+        if not self.laser_active or not self.galvo_controller:
+            return
+
+        bbox = target_info['bbox']
+        centroid = [(bbox[0] + bbox[2] / 2), (bbox[1] + bbox[3] / 2)]
+        galvo_x, galvo_y = self.pixel_to_galvo(centroid[0], centroid[1])
+
+        # 更新振镜位置但保持激光开启
+        self.galvo_controller.move_to_position(galvo_x, galvo_y)
+
+        # 发布更新的位置
+        xy_msg = Int32MultiArray()
+        xy_msg.data = [galvo_x, galvo_y, 1]
+        self.xy_pub.publish(xy_msg)
 
     def complete_laser_treatment(self):
         """完成激光处理"""
@@ -290,7 +316,10 @@ class LaserWeedingNode:
             'laser_duration': self.laser_duration
         }
 
-        self.send_to_teensy(32768, 32768)
+        # 关闭激光并回到中心
+        if self.galvo_controller:
+            self.galvo_controller.laser_off()
+            self.galvo_controller.move_to_center()
 
         xy_msg = Int32MultiArray()
         xy_msg.data = [32768, 32768, 0]
@@ -306,8 +335,9 @@ class LaserWeedingNode:
 
     def abort_current_laser_task(self):
         """中止当前激光任务"""
-        if self.laser_active:
-            self.send_to_teensy(32768, 32768)
+        if self.laser_active and self.galvo_controller:
+            self.galvo_controller.laser_off()
+            self.galvo_controller.move_to_center()
 
         self.laser_active = False
         self.current_target_id = None
@@ -315,27 +345,20 @@ class LaserWeedingNode:
 
         self.select_next_target()
 
-    def calculate_xy(self, centroid):
-        """将像素坐标转换为激光控制坐标"""
-        px, py = centroid
-        x = int((px / self.image_width) * 65535)
-        y = int((py / self.image_height) * 65535)
-        x = max(0, min(65535, x))
-        y = max(0, min(65535, y))
-        return x, y
-
-    def send_to_teensy(self, x, y):
-        """发送坐标到Teensy"""
-        if self.serial_port is None:
-            rospy.logdebug(f"Serial port not available, skipping command: XY:{x},{y}")
-            return
-
-        try:
-            command = f"XY:{x},{y}\n"
-            self.serial_port.write(command.encode())
-            rospy.logdebug(f"Sent to Teensy: {command.strip()}")
-        except Exception as e:
-            rospy.logerr(f"Failed to send to Teensy: {e}")
+    def pixel_to_galvo(self, pixel_x, pixel_y):
+        """将像素坐标转换为振镜坐标"""
+        if self.galvo_controller:
+            return self.galvo_controller.pixel_to_galvo(
+                pixel_x, pixel_y,
+                self.image_width, self.image_height
+            )
+        else:
+            # 回退到原有方法
+            x = int((pixel_x / self.image_width) * 65535)
+            y = int((pixel_y / self.image_height) * 65535)
+            x = max(0, min(65535, x))
+            y = max(0, min(65535, y))
+            return x, y
 
     def get_processing_status(self):
         """获取处理状态信息"""
