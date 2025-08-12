@@ -488,7 +488,8 @@ class WeedDetector:
                     tracker="bytetrack.yaml",
                     conf=self.confidence_threshold,
                     device=self.device,
-                    classes=[self.weed_class_id, self.crop_class_id]  # 只跟踪特定类别
+                    classes=[self.weed_class_id, self.crop_class_id],  # 只跟踪特定类别，
+                    verbose=False,
                 )
             elif self.tracker_type == 'botsort':
                 results = self.model.track(
@@ -497,7 +498,8 @@ class WeedDetector:
                     tracker="botsort.yaml",
                     conf=self.confidence_threshold,
                     device=self.device,
-                    classes=[self.weed_class_id, self.crop_class_id]
+                    classes=[self.weed_class_id, self.crop_class_id],
+                    verbose=False,
                 )
 
             # 处理跟踪结果
@@ -614,7 +616,7 @@ class WeedDetector:
         processed_image = self.preprocess_image(np_image)
 
         try:
-            results = self.model(processed_image, conf=self.confidence_threshold, device=self.device)
+            results = self.model(processed_image, conf=self.confidence_threshold, device=self.device, verbose=False)
 
             if len(results) > 0 and results[0].boxes is not None:
                 boxes = results[0].boxes
@@ -846,14 +848,14 @@ class WeedDetector:
                 f"Avg Det/Frame: {self.detection_stats['avg_detections_per_frame']:.1f}"
             ]
 
-        box_height = len(info_lines) * 25 + 10
-        cv2.rectangle(image, (10, 10), (300, box_height), (0, 0, 0), -1)
-        cv2.rectangle(image, (10, 10), (300, box_height), (255, 255, 255), 2)
+        # box_height = len(info_lines) * 25 + 10
+        # cv2.rectangle(image, (10, 10), (300, box_height), (0, 0, 0), -1)
+        # cv2.rectangle(image, (10, 10), (300, box_height), (255, 255, 255), 2)
 
-        for i, line in enumerate(info_lines):
-            y_pos = 30 + i * 25
-            cv2.putText(image, line, (15, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # for i, line in enumerate(info_lines):
+        #     y_pos = 30 + i * 25
+        #     cv2.putText(image, line, (15, y_pos),
+        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     def get_track_info(self):
         """获取当前跟踪信息（统一接口）"""

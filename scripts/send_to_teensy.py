@@ -64,6 +64,18 @@ class XY2_100Controller:
             rospy.logerr(f"Failed to connect to {self.port}: {e}")
             self.serial_port = None
 
+    def is_connected(self):
+        """检查连接状态"""
+        if self.serial_port is None:
+            self.connected = False
+            return False
+
+        try:
+            return self.serial_port.is_open and self.connected
+        except:
+            self.connected = False
+            return False
+
     def initialize_galvo(self):
         """初始化振镜到中心位置"""
         rospy.loginfo("Initializing galvo...")
