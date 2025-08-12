@@ -34,9 +34,9 @@ class SystemState(Enum):
 class PredictiveLaserWeedingNode:
     def __init__(self):
         try:
-            rospy.init_node('predictive_laser_weeding_node', anonymous=True)
+            rospy.init_node('laser_weeding_node', anonymous=True)
             rospy.loginfo("=" * 50)
-            rospy.loginfo("Starting Predictive Laser Weeding Node...")
+            rospy.loginfo("Starting Laser Weeding Node...")
             rospy.loginfo("=" * 50)
 
             # Parameters
@@ -66,6 +66,7 @@ class PredictiveLaserWeedingNode:
 
             # 预测参数
             self.prediction_time = self.total_system_delay + rospy.get_param('~extra_prediction', 0.02)  # 额外预测20ms
+            # self.prediction_time = 0.02
             self.max_prediction_distance = rospy.get_param('~max_prediction_distance', 100)  # 最大预测距离限制
 
             # 激光控制参数
@@ -79,6 +80,7 @@ class PredictiveLaserWeedingNode:
             self.target_queue = []  # 目标队列
             self.min_confidence = rospy.get_param('~min_confidence', 0.3)
             self.target_stable_frames = rospy.get_param('~target_stable_frames', 2)
+            self.terget_timeout = rospy.get_param('~terget_timeout', 0.5)   #清除消失目标时间
 
             # 系统状态
             self.system_state = SystemState.IDLE
@@ -115,7 +117,7 @@ class PredictiveLaserWeedingNode:
             self.crop_class_id = rospy.get_param('~crop_class_id', 1)
             self.model_path = rospy.get_param('~model_path', '')
             self.model_type = rospy.get_param('~model_type', 'yolov8')
-            self.device = rospy.get_param('~device', 'cpu')
+            self.device = rospy.get_param('~device', '0')
             self.confidence_threshold = rospy.get_param('~confidence_threshold', 0.3)
 
             # 跟踪器配置
@@ -191,10 +193,7 @@ class PredictiveLaserWeedingNode:
             )
 
             rospy.loginfo("=" * 50)
-            rospy.loginfo("Predictive Laser Weeding Node Initialized!")
-            rospy.loginfo(f"Total system delay: {self.total_system_delay * 1000:.1f}ms")
-            rospy.loginfo(f"Prediction time: {self.prediction_time * 1000:.1f}ms")
-            rospy.loginfo(f"Using Kalman filter: {self.use_kalman_filter}")
+            rospy.loginfo("Laser Weeding Node Initialized!")
             rospy.loginfo("=" * 50)
 
         except Exception as e:
@@ -288,7 +287,6 @@ class PredictiveLaserWeedingNode:
             rospy.logerr(f"Image callback error: {e}")
 
     def update_all_targets(self, detection_results, current_time):
-        """更新所有目标信息"""
         current_target_ids = set()
 
         # 更新检测到的目标
@@ -317,7 +315,7 @@ class PredictiveLaserWeedingNode:
                     rospy.loginfo(f"New target added to queue: ID {track_id}")
 
         # 清理长时间未见的目标
-        timeout = 2.0  # 2秒超时
+        timeout = self.terget_timeout
         to_remove = []
         for track_id, target_info in self.all_detected_targets.items():
             if track_id not in current_target_ids:
@@ -335,6 +333,7 @@ class PredictiveLaserWeedingNode:
                 self.current_target_id = None
                 self.change_state(SystemState.IDLE)
             rospy.loginfo(f"Target ID {track_id} removed due to timeout")
+        return
 
     def get_current_target_info(self):
         """获取当前目标的完整信息"""
@@ -746,12 +745,12 @@ class PredictiveLaserWeedingNode:
                     color = (0, 0, 255)  # 红色 - 激光照射中
                     label += " [LASER]"
                 elif self.system_state == SystemState.AIMING:
-                    color = (255, 0, 0)  # 蓝色 - 瞄准中
+                    color = (0, 255, 255)  # 黄色 - 瞄准中
                     label += " [AIMING]"
                 elif self.system_state == SystemState.TRACKING:
                     color = (0, 255, 255)  # 黄色 - 跟踪中
                     label += " [TRACKING]"
-                thickness = 3
+                thickness = 2
             elif track_id in self.target_queue:
                 color = (255, 255, 0)  # 青色 - 队列中
                 label += " [QUEUE]"
@@ -774,19 +773,19 @@ class PredictiveLaserWeedingNode:
 
             # 绘制预测位置
             predicted_pos = self.predict_future_position(time.time() + self.prediction_time)
-            if predicted_pos:
-                cv2.circle(result_image, (int(predicted_pos[0]), int(predicted_pos[1])), 5, (0, 0, 255), -1)
-
-                # 绘制预测轨迹
-                cv2.arrowedLine(result_image,
-                                (int(current_pos[0]), int(current_pos[1])),
-                                (int(predicted_pos[0]), int(predicted_pos[1])),
-                                (255, 0, 255), 2)
-
-                # 显示预测时间
-                cv2.putText(result_image, f"Pred: {self.prediction_time * 1000:.0f}ms",
-                            (int(predicted_pos[0] + 10), int(predicted_pos[1])),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            # if predicted_pos:
+            #     cv2.circle(result_image, (int(predicted_pos[0]), int(predicted_pos[1])), 5, (0, 0, 255), -1)
+            #
+            #     # 绘制预测轨迹
+            #     cv2.arrowedLine(result_image,
+            #                     (int(current_pos[0]), int(current_pos[1])),
+            #                     (int(predicted_pos[0]), int(predicted_pos[1])),
+            #                     (255, 0, 255), 2)
+            #
+            #     # 显示预测时间
+            #     cv2.putText(result_image, f"Pred: {self.prediction_time * 1000:.0f}ms",
+            #                 (int(predicted_pos[0] + 10), int(predicted_pos[1])),
+            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
             # 绘制振镜位置
             if self.tracking_active:
@@ -799,15 +798,24 @@ class PredictiveLaserWeedingNode:
                     for radius in [15, 25, 35]:
                         alpha = 1.0 - (radius / 35.0) * 0.6
                         overlay = result_image.copy()
-                        cv2.circle(overlay, (int(galvo_pixel[0]), int(galvo_pixel[1])), radius, galvo_color, 2)
-                        cv2.addWeighted(overlay, alpha, result_image, 1 - alpha, 0, result_image)
+                        cv2.circle(overlay, (int(galvo_pixel[0]), int(galvo_pixel[1])), radius, galvo_color, 1)
+                        # cv2.addWeighted(overlay, alpha, result_image, 1 - alpha, 0, result_image)
                 else:
                     galvo_color = (255, 255, 0)  # 黄色
 
-                cv2.circle(result_image, (int(galvo_pixel[0]), int(galvo_pixel[1])), 8, galvo_color, 2)
+                cv2.circle(result_image, (int(galvo_pixel[0]), int(galvo_pixel[1])), 8, galvo_color, 1)
                 cv2.putText(result_image, "GALVO",
                             (int(galvo_pixel[0] + 10), int(galvo_pixel[1] + 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, galvo_color, 1)
+                # 绘制十字线
+                cv2.line(result_image,
+                         (int(galvo_pixel[0] - 15), int(galvo_pixel[1])),
+                         (int(galvo_pixel[0] + 15), int(galvo_pixel[1])),
+                         galvo_color, 1)
+                cv2.line(result_image,
+                         (int(galvo_pixel[0]), int(galvo_pixel[1] - 15)),
+                         (int(galvo_pixel[0]), int(galvo_pixel[1] + 15)),
+                         galvo_color, 1)
 
             # 显示速度信息
             if self.velocity_history:
@@ -828,27 +836,27 @@ class PredictiveLaserWeedingNode:
             f"Pred: {self.prediction_time * 1000:.0f}ms"
         ]
 
-        # 绘制状态信息背景
-        font_scale = 0.4
-        line_height = 18
-        box_width = 180
-        box_height = len(info_lines) * line_height + 10
-
-        if self.laser_on:
-            bg_color = (0, 0, 80)  # 深红背景
-            border_color = (0, 0, 255)  # 红色边框
-        else:
-            bg_color = (40, 40, 40)  # 深灰背景
-            border_color = (200, 200, 200)  # 浅灰边框
-
-        cv2.rectangle(result_image, (5, 5), (box_width, box_height), bg_color, -1)
-        cv2.rectangle(result_image, (5, 5), (box_width, box_height), border_color, 1)
-
-        # 绘制状态信息文字
-        for i, line in enumerate(info_lines):
-            y_pos = 20 + i * line_height
-            cv2.putText(result_image, line, (10, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
+        # # 绘制状态信息背景
+        # font_scale = 0.4
+        # line_height = 18
+        # box_width = 180
+        # box_height = len(info_lines) * line_height + 10
+        #
+        # if self.laser_on:
+        #     bg_color = (0, 0, 80)  # 深红背景
+        #     border_color = (0, 0, 255)  # 红色边框
+        # else:
+        #     bg_color = (40, 40, 40)  # 深灰背景
+        #     border_color = (200, 200, 200)  # 浅灰边框
+        #
+        # cv2.rectangle(result_image, (5, 5), (box_width, box_height), bg_color, -1)
+        # cv2.rectangle(result_image, (5, 5), (box_width, box_height), border_color, 1)
+        #
+        # # 绘制状态信息文字
+        # for i, line in enumerate(info_lines):
+        #     y_pos = 20 + i * line_height
+        #     cv2.putText(result_image, line, (10, y_pos),
+        #                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
 
         return result_image
 
