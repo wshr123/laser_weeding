@@ -395,12 +395,12 @@ class GalvoTrackingNode:
 
             # 根据跟踪状态选择颜色
             if self.tracking_active:
-                color = (0, 0, 255)  # 红色 - 正在跟踪
-                thickness = 3
+                color = (0, 255, 255)  # 红色 - 正在跟踪
+                thickness = 2
                 status_text = "TRACKING"
             elif self.stable_target_count >= self.target_stable_frames:
                 color = (0, 255, 0)  # 绿色 - 稳定目标
-                thickness = 3
+                thickness = 2
                 status_text = "STABLE"
             else:
                 color = (0, 255, 255)  # 黄色 - 候选目标
@@ -414,15 +414,15 @@ class GalvoTrackingNode:
             # 绘制中心点
             cv2.circle(result_image, (int(centroid[0]), int(centroid[1])), 5, color, -1)
 
-            # 绘制十字线
-            cv2.line(result_image,
-                     (int(centroid[0] - 15), int(centroid[1])),
-                     (int(centroid[0] + 15), int(centroid[1])),
-                     color, 2)
-            cv2.line(result_image,
-                     (int(centroid[0]), int(centroid[1] - 15)),
-                     (int(centroid[0]), int(centroid[1] + 15)),
-                     color, 2)
+            # # 绘制十字线
+            # cv2.line(result_image,
+            #          (int(centroid[0] - 15), int(centroid[1])),
+            #          (int(centroid[0] + 15), int(centroid[1])),
+            #          color, 2)
+            # cv2.line(result_image,
+            #          (int(centroid[0]), int(centroid[1] - 15)),
+            #          (int(centroid[0]), int(centroid[1] + 15)),
+            #          color, 2)
 
             # 绘制振镜位置指示
             if self.tracking_active:
@@ -447,18 +447,18 @@ class GalvoTrackingNode:
             label_y = int(y - 10) if y > 30 else int(y + h + 25)
 
             # 绘制标签背景
-            cv2.rectangle(result_image,
-                          (int(x), label_y - label_size[1] - 5),
-                          (int(x + label_size[0] + 10), label_y + 5),
-                          color, -1)
-
-            # 绘制标签文字
-            text_color = (255, 255, 255) if color != (0, 255, 255) else (0, 0, 0)
-            cv2.putText(result_image, label, (int(x + 5), label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+            # cv2.rectangle(result_image,
+            #               (int(x), label_y - label_size[1] - 5),
+            #               (int(x + label_size[0] + 10), label_y + 5),
+            #               color, -1)
+            #
+            # # 绘制标签文字
+            # text_color = (255, 255, 255) if color != (0, 255, 255) else (0, 0, 0)
+            # cv2.putText(result_image, label, (int(x + 5), label_y),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
 
         # 绘制统计信息
-        self.draw_statistics(result_image)
+        # self.draw_statistics(result_image)
 
         return result_image
 

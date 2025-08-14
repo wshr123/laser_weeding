@@ -542,19 +542,19 @@ class PredictiveGalvoTrackingNode:
 
             # 绘制预测位置
             predicted_pos = self.predict_future_position(time.time() + self.prediction_time)
-            if predicted_pos:
-                cv2.circle(result_image, (int(predicted_pos[0]), int(predicted_pos[1])), 5, (0, 0, 255), -1)
-
-                # 绘制预测轨迹
-                cv2.arrowedLine(result_image,
-                                (int(current_pos[0]), int(current_pos[1])),
-                                (int(predicted_pos[0]), int(predicted_pos[1])),
-                                (255, 0, 255), 2)
-
-                # 显示预测时间
-                cv2.putText(result_image, f"Pred: {self.prediction_time * 1000:.0f}ms",
-                            (int(predicted_pos[0] + 10), int(predicted_pos[1])),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+            # if predicted_pos:
+            #     cv2.circle(result_image, (int(predicted_pos[0]), int(predicted_pos[1])), 5, (0, 0, 255), -1)
+            #
+            #     # 绘制预测轨迹
+            #     cv2.arrowedLine(result_image,
+            #                     (int(current_pos[0]), int(current_pos[1])),
+            #                     (int(predicted_pos[0]), int(predicted_pos[1])),
+            #                     (255, 0, 255), 2)
+            #
+            #     # 显示预测时间
+            #     cv2.putText(result_image, f"Pred: {self.prediction_time * 1000:.0f}ms",
+            #                 (int(predicted_pos[0] + 10), int(predicted_pos[1])),
+            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
 
             # 绘制振镜位置
             if self.tracking_active:
@@ -564,12 +564,12 @@ class PredictiveGalvoTrackingNode:
                             (int(galvo_pixel[0] + 10), int(galvo_pixel[1] + 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
-            # 显示速度信息
-            if self.velocity_history:
-                velocity = self.velocity_history[-1]['velocity']
-                speed = np.sqrt(velocity[0] ** 2 + velocity[1] ** 2)
-                cv2.putText(result_image, f"Speed: {speed:.1f}px/s",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # # 显示速度信息
+            # if self.velocity_history:
+            #     velocity = self.velocity_history[-1]['velocity']
+            #     speed = np.sqrt(velocity[0] ** 2 + velocity[1] ** 2)
+            #     cv2.putText(result_image, f"Speed: {speed:.1f}px/s",
+            #                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         return result_image
 

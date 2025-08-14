@@ -558,7 +558,7 @@ class WeedDetector:
             )
 
             # 绘制结果
-            det_image = self.draw_results_ultralytics(det_image, plant_detections, tracked_weeds)
+            # det_image = self.draw_results_ultralytics(det_image, plant_detections, tracked_weeds)
 
             return det_image, tracked_weeds
 
@@ -587,6 +587,7 @@ class WeedDetector:
 
         # 计算质量分数
         self.track_quality_scores[track_id] = self.calculate_ultralytics_track_quality(track_id)
+        return
 
     def calculate_ultralytics_track_quality(self, track_id):
         """计算Ultralytics跟踪器的轨迹质量"""
@@ -749,20 +750,19 @@ class WeedDetector:
             label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
             label_y = int(y - 5) if y > 30 else int(y + h + 20)
 
-            cv2.rectangle(result_image,
-                          (int(x), label_y - label_size[1] - 5),
-                          (int(x + label_size[0] + 5), label_y + 5),
-                          color, -1)
+            # cv2.rectangle(result_image,
+            #               (int(x), label_y - label_size[1] - 5),
+            #               (int(x + label_size[0] + 5), label_y + 5),
+            #               color, -1)
+            #
+            # text_color = (0, 0, 0) if color == (0, 255, 255) else (255, 255, 255)
+            # cv2.putText(result_image, label, (int(x + 2), label_y),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
 
-            text_color = (0, 0, 0) if color == (0, 255, 255) else (255, 255, 255)
-            cv2.putText(result_image, label, (int(x + 2), label_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
-
-        self.draw_statistics(result_image)
+        # self.draw_statistics(result_image)
         return result_image
 
     def draw_results_ultralytics(self, image, plant_detections, tracked_weeds):
-        """绘制检测和跟踪结果（Ultralytics跟踪器）"""
         result_image = image.copy()
 
         for plant_det, conf in plant_detections:
@@ -782,16 +782,18 @@ class WeedDetector:
             consecutive_hits = quality_info['consecutive_hits']
 
             # 根据质量选择颜色
-            if quality_score > 0.6 and consecutive_hits >= 3:
-                color = (0, 255, 255)  # 黄色 - 稳定轨迹
-                thickness = 2
-            elif consecutive_hits >= 1:
-                color = (0, 255, 0)  # 绿色 - 新轨迹
-                thickness = 2
-            else:
-                color = (255, 0, 0)  # 蓝色 - 不稳定
-                thickness = 1
+            # if quality_score > 0.6 and consecutive_hits >= 3:
+            #     color = (0, 255, 255)  # 黄色 - 稳定轨迹
+            #     thickness = 2
+            # elif consecutive_hits >= 1:
+            #     color = (0, 255, 0)  # 绿色 - 新轨迹
+            #     thickness = 2
+            # else:
+            #     color = (255, 0, 0)  # 蓝色 - 不稳定
+            #     thickness = 1
 
+            color = (0, 255, 255)
+            thickness = 2
             cv2.rectangle(result_image, (int(x), int(y)), (int(x + w), int(y + h)),
                           color, thickness)
 
@@ -801,12 +803,12 @@ class WeedDetector:
 
             label_parts = [f'W_{track_id}']
             label_parts.append(f'({avg_conf:.2f})')
-
-            if consecutive_hits >= 3:
-                label_parts.append(f'[H{consecutive_hits}]')
-
-            if quality_score > 0:
-                label_parts.append(f'[Q{quality_score:.1f}]')
+            #
+            # if consecutive_hits >= 3:
+            #     label_parts.append(f'[H{consecutive_hits}]')
+            #
+            # if quality_score > 0:
+            #     label_parts.append(f'[Q{quality_score:.1f}]')
 
             label = ' '.join(label_parts)
 
@@ -821,8 +823,8 @@ class WeedDetector:
             text_color = (0, 0, 0) if color == (0, 255, 255) else (255, 255, 255)
             cv2.putText(result_image, label, (int(x + 2), label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 2)
-
-        self.draw_statistics(result_image)
+        #左上角显示信息
+        # self.draw_statistics(result_image)
         return result_image
 
     def draw_statistics(self, image):
@@ -848,14 +850,15 @@ class WeedDetector:
                 f"Avg Det/Frame: {self.detection_stats['avg_detections_per_frame']:.1f}"
             ]
 
-        # box_height = len(info_lines) * 25 + 10
-        # cv2.rectangle(image, (10, 10), (300, box_height), (0, 0, 0), -1)
-        # cv2.rectangle(image, (10, 10), (300, box_height), (255, 255, 255), 2)
+        box_height = len(info_lines) * 25 + 10
+        cv2.rectangle(image, (10, 10), (300, box_height), (0, 0, 0), -1)
+        cv2.rectangle(image, (10, 10), (300, box_height), (255, 255, 255), 2)
 
-        # for i, line in enumerate(info_lines):
-        #     y_pos = 30 + i * 25
-        #     cv2.putText(image, line, (15, y_pos),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        for i, line in enumerate(info_lines):
+            y_pos = 30 + i * 25
+            cv2.putText(image, line, (15, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        return
 
     def get_track_info(self):
         """获取当前跟踪信息（统一接口）"""
