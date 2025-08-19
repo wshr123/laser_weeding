@@ -27,7 +27,7 @@ class XY2_100Controller:
         self.center_value = 32768
 
         # 振镜工作范围
-        self.scan_angle = 20
+        self.scan_angle = 30
         self.field_size = 100
 
         # 当前位置
@@ -107,9 +107,9 @@ class XY2_100Controller:
         if y > 32767:
             y = y - 65536
 
-        # 限制范围到±30000
-        x = max(-30000, min(30000, int(x)))
-        y = max(-30000, min(30000, int(y)))
+        # 限制范围到±32767
+        x = max(-32767, min(32767, int(x)))
+        y = max(-32767, min(32767, int(y)))
 
         command = f"XY:{x},{y}"
         if self.send_command(command):
@@ -139,8 +139,8 @@ class XY2_100Controller:
         norm_y = pixel_y / image_height
 
         # 转换到有符号振镜坐标系 (-30000 to 30000)
-        galvo_x = int((norm_x - 0.5) * 60000)  # -30000 to 30000
-        galvo_y = int((norm_y - 0.5) * 60000)  # -30000 to 30000
+        galvo_x = int((norm_x - 0.5) * 65535)  # -30000 to 30000
+        galvo_y = int((norm_y - 0.5) * 65535)  # -30000 to 30000
 
         return galvo_x, galvo_y
 

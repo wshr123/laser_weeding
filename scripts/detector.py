@@ -95,7 +95,7 @@ class WeedTracker:
             if (dist < self.position_tolerance and
                     size_sim > self.size_tolerance and
                     confidence > 0.3):
-                rospy.loginfo(f"Recovering deleted track {deleted_id}")
+                # rospy.loginfo(f"Recovering deleted track {deleted_id}")
                 self.recover_deleted_track(deleted_id, deleted_info, new_bbox, new_centroid, confidence)
                 return False
         return True
@@ -471,16 +471,13 @@ class WeedDetector:
         return current_detections
 
     def detect_and_track_weeds_ultralytics(self, np_image):
-        """使用Ultralytics内置跟踪器检测并跟踪杂草"""
         self.frame_count += 1
         det_image = np_image.copy()
-        self.ctr_points = []
+        self.ctr_points = []    #center points
 
-        # 预处理图像
         processed_image = self.preprocess_image(np_image)
 
         try:
-            # 使用Ultralytics的track方法
             if self.tracker_type == 'bytetrack':
                 results = self.model.track(
                     processed_image,
@@ -488,7 +485,7 @@ class WeedDetector:
                     tracker="bytetrack.yaml",
                     conf=self.confidence_threshold,
                     device=self.device,
-                    classes=[self.weed_class_id, self.crop_class_id],  # 只跟踪特定类别，
+                    classes=[self.weed_class_id, self.crop_class_id],
                     verbose=False,
                 )
             elif self.tracker_type == 'botsort':
@@ -502,9 +499,8 @@ class WeedDetector:
                     verbose=False,
                 )
 
-            # 处理跟踪结果
             tracked_weeds = []
-            plant_detections = []
+            crop_detections = []
 
             if len(results) > 0 and results[0].boxes is not None:
                 boxes = results[0].boxes
@@ -525,15 +521,13 @@ class WeedDetector:
                     conf = float(confidences[i])
                     cls = int(classes[i])
                     track_id = int(track_ids[i])
-
-                    # 转换为 [x, y, w, h] 格式
+                    #xyxy -> xywh
                     bbox_xywh = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
                     if cls == self.crop_class_id and conf > 0.4:
-                        # 作物检测
                         width, height = x2 - x1, y2 - y1
-                        if width < 100 and height < 100:
-                            plant_detections.append((bbox_xywh, conf))
+                        if width < 100 and height < 100:    #todo 根据实际作物尺寸改
+                            crop_detections.append((bbox_xywh, conf))
 
                     elif cls == self.weed_class_id and conf > self.confidence_threshold:
                         # 更新轨迹信息
@@ -567,7 +561,6 @@ class WeedDetector:
             return np_image, []
 
     def update_ultralytics_track_info(self, track_id, bbox, confidence):
-        """更新Ultralytics跟踪器的轨迹信息"""
         # 更新置信度历史
         self.track_confidence_history[track_id].append(confidence)
 
@@ -590,7 +583,6 @@ class WeedDetector:
         return
 
     def calculate_ultralytics_track_quality(self, track_id):
-        """计算Ultralytics跟踪器的轨迹质量"""
         history = list(self.track_confidence_history[track_id])
         if not history:
             return 0
@@ -598,13 +590,12 @@ class WeedDetector:
         avg_conf = np.mean(history)
         conf_stability = 1.0 - np.std(history) if len(history) > 1 else 1.0
         consecutive_hits = self.track_consecutive_hits[track_id]
-        hit_ratio = min(consecutive_hits / 3, 1.0)  # 假设3次命中为稳定
+        hit_ratio = min(consecutive_hits / 3, 1.0)  # 连续3帧检测到为稳定
 
         quality = (avg_conf * 0.5 + conf_stability * 0.3 + hit_ratio * 0.2)
         return quality
 
     def get_ultralytics_track_quality(self, track_id):
-        """获取Ultralytics跟踪器的轨迹质量信息"""
         history = list(self.track_confidence_history[track_id])
         return {
             'avg_confidence': np.mean(history) if history else 0,
@@ -663,12 +654,9 @@ class WeedDetector:
         return plant_detections, weed_detections
 
     def detect_and_track_weeds(self, np_image):
-        """统一的检测和跟踪接口"""
         if self.use_custom_tracker:
-            # 使用自定义跟踪器
             return self.detect_and_track_weeds_custom(np_image)
         else:
-            # 使用Ultralytics跟踪器
             return self.detect_and_track_weeds_ultralytics(np_image)
 
     def detect_and_track_weeds_custom(self, np_image):
@@ -937,7 +925,7 @@ class WeedDetector:
 
         self.detection_history.clear()
         self.frame_count = 0
-        rospy.loginfo(f"Weed tracker reset for {self.tracker_type} tracker")
+        # rospy.loginfo(f"Weed tracker reset for {self.tracker_type} tracker")
 
     def get_statistics(self):
         """获取完整统计信息"""

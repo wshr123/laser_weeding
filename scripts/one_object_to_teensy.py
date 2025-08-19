@@ -23,7 +23,7 @@ class XY2_100Controller:
         # 当前位置
         self.current_x = 0
         self.current_y = 0
-
+        self.galvo_height_mm = 1000
         # 调试模式
         self.debug_mode = True
 
@@ -111,16 +111,59 @@ class XY2_100Controller:
         self.move_to_position(0, 0)
 
     def pixel_to_galvo(self, pixel_x, pixel_y, image_width=640, image_height=480):
-        """将像素坐标转换为振镜坐标"""
-        # 归一化到0-1范围
-        norm_x = pixel_x / image_width
-        norm_y = pixel_y / image_height
+        """
+        将图像像素坐标转换为 XY2-100 可用的振镜坐标（-32768 ~ 32767）
+        使用激光投影几何模型考虑振镜高度和扫描角度
+        """
+        # 振镜到投影平面的高度（单位 mm）
+        galvo_height_mm = self.galvo_height_mm  # 可设为参数或 ROS param
+        scan_angle_deg = self.scan_angle / 2  # scan_angle 是总角度，这里一边是半角
 
-        # 转换到有符号振镜坐标系 (-30000 to 30000)
-        galvo_x = int((norm_x - 0.5) * 60000)
-        galvo_y = int((norm_y - 0.5) * 60000)
+        # 最大物理范围（mm） = H * tan(最大角度)
+        max_x_mm = galvo_height_mm * np.tan(np.radians(scan_angle_deg))
+        max_y_mm = galvo_height_mm * np.tan(np.radians(scan_angle_deg))
 
+        # Step 1: 像素 → 角度
+        theta_x_deg = ((pixel_x - image_width / 2) / (image_width / 2)) * scan_angle_deg
+        theta_y_deg = ((pixel_y - image_height / 2) / (image_height / 2)) * scan_angle_deg
+
+        # Step 2: 角度 → 落点（物理坐标）
+        x_mm = galvo_height_mm * np.tan(np.radians(theta_x_deg))
+        y_mm = galvo_height_mm * np.tan(np.radians(theta_y_deg))
+
+        # Step 3: 物理坐标 → 振镜控制值（-32768 ~ +32767）
+        galvo_x = int((x_mm / max_x_mm) * 32767)
+        galvo_y = int((y_mm / max_y_mm) * 32767)
+
+        # 限制范围
+        galvo_x = max(-32768, min(32767, galvo_x))
+        galvo_y = max(-32768, min(32767, galvo_y))
+        # print(galvo_x, galvo_y)
         return galvo_x, galvo_y
+
+    def galvo_to_pixel(self, galvo_x, galvo_y, image_width=640, image_height=480):
+        """
+        将振镜坐标转换为图像像素坐标（用于绘制等）
+        """
+        galvo_height_mm = self.galvo_height_mm
+        scan_angle_deg = self.scan_angle / 2
+
+        max_x_mm = galvo_height_mm * np.tan(np.radians(scan_angle_deg))
+        max_y_mm = galvo_height_mm * np.tan(np.radians(scan_angle_deg))
+
+        # Galvo坐标 → 物理坐标
+        x_mm = (galvo_x / 32767.0) * max_x_mm
+        y_mm = (galvo_y / 32767.0) * max_y_mm
+
+        # 物理坐标 → 角度
+        theta_x_deg = np.degrees(np.arctan2(x_mm, galvo_height_mm))
+        theta_y_deg = np.degrees(np.arctan2(y_mm, galvo_height_mm))
+
+        # 角度 → 像素
+        pixel_x = (theta_x_deg / scan_angle_deg) * (image_width / 2) + image_width / 2
+        pixel_y = (theta_y_deg / scan_angle_deg) * (image_height / 2) + image_height / 2
+
+        return int(pixel_x), int(pixel_y)
 
     def get_current_position(self):
         """获取当前位置"""

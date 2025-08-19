@@ -558,7 +558,7 @@ class PredictiveGalvoTrackingNode:
 
             # 绘制振镜位置
             if self.tracking_active:
-                galvo_pixel = self.galvo_to_pixel(self.last_galvo_position[0], self.last_galvo_position[1])
+                galvo_pixel = self.galvo_controller.galvo_to_pixel(self.last_galvo_position[0], self.last_galvo_position[1])
                 cv2.circle(result_image, (int(galvo_pixel[0]), int(galvo_pixel[1])), 8, (255, 255, 0), 2)
                 cv2.putText(result_image, "GALVO",
                             (int(galvo_pixel[0] + 10), int(galvo_pixel[1] + 10)),
