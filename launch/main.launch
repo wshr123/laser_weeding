@@ -62,39 +62,46 @@
     <node pkg="laser_weeding" type="main.py" name="laser_weeding_node" output="screen" required="true">
         <!-- 模型参数 -->
         <param name="model_type" value="yolov11" />
-        <param name="mod
-        el_path" value="/home/zhong/runs/detect/fake_intra/weights/best.pt" />
+        <param name="model_path" value="/home/zhong/my_workspace/src/laser_weeding/weights/yolo11m.pt" />
         <param name="device" value="0" />
+        <param name="tracker_type" value="bytetrack" />
 
         <!-- 检测参数 -->
-        <param name="weed_class_id" value="0" />
+        <param name="weed_class_id" value="64" />
         <param name="confidence_threshold" value="0.3" />
 
         <!-- 核心预测参数 -->
-        <param name="total_delay" value="0.08" />          <!-- 总系统延迟 80ms -->
-        <param name="prediction_time" value="0.5" />      <!-- 预测时间 150ms -->
-        <param name="use_kalman" value="true" />          <!-- 是否使用卡尔曼滤波 -->
-        <param name="max_prediction_distance" value="200" /> <!-- 最大预测距离(像素) -->
+        <param name="total_delay" value="0.08" />
+        <param name="prediction_time" value="0.5" />
+        <param name="use_kalman" value="true" />
+        <param name="max_prediction_distance" value="200" />
 
         <!-- 激光控制 -->
-        <param name="aiming_time" value="0.1" />           <!-- 瞄准时间 100ms -->
-        <param name="laser_time" value="0.4" />            <!-- 激光时间 200ms -->
+        <param name="aiming_time" value="0.15" />
+        <param name="laser_time" value="0.4" />
 
         <!-- 振镜参数 -->
         <param name="serial_port" value="/dev/ttyACM0" />
         <param name="serial_baudrate" value="115200" />
-        <param name="min_move_step" value="2" />
+        <param name="min_move_step" value="0" />
 
         <!-- 图像参数 -->
         <param name="image_width" value="640" />
         <param name="image_height" value="480" />
         <param name="image_topic" value="/camera/image_raw" />
+        <param name="camera_info_topic" value="/camera/camera_info" />
 
         <!-- 目标管理 -->
-        <param name="target_timeout" value="0.3" />        <!-- 目标超时 500ms -->
-        <param name="min_stable_frames" value="3" />       <!-- 最小稳定帧数 -->
-    </node>
+        <param name="target_timeout" value="0.3" />
+        <param name="min_stable_frames" value="1" />
 
+        <!-- ========== 坐标变换模式选择 ========== -->
+        <!-- true: 使用3D几何变换, false: 使用简单线性映射（原始方法）-->
+        <param name="use_3d_transform" value="true" />
+
+        <!-- 3D变换配置文件路径（仅3D模式时需要）-->
+        <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
+    </node>
     <!-- USB摄像头节点 -->
     <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
         <param name="video_device" value="/dev/video4" />
