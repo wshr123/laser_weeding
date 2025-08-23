@@ -1,0 +1,32 @@
+<!-- manual_galvo_calibration.launch -->
+<launch>
+    <!-- 手动振镜校准节点 -->
+    <node pkg="laser_weeding" type="galvo_calibrator.py" name="manual_galvo_calibration_node" output="screen">
+        <!-- 振镜参数 -->
+        <param name="serial_port" value="/dev/ttyACM0" />
+        <param name="serial_baudrate" value="115200" />
+
+        <!-- 坐标变换配置 -->
+        <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
+
+        <!-- 图像参数 -->
+        <param name="image_width" value="640" />
+        <param name="image_height" value="480" />
+        <param name="image_topic" value="/camera/image_raw" />
+
+        <!-- 校准结果保存 -->
+        <param name="calibration_result_file" value="$(find laser_weeding)/yaml/manual_galvo_calibration.yaml" />
+    </node>
+
+    <!-- USB摄像头节点 -->
+    <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
+        <param name="video_device" value="/dev/video4" />
+        <param name="image_width" value="640" />
+        <param name="image_height" value="480" />
+        <param name="pixel_format" value="yuyv" />
+        <param name="camera_frame_id" value="usb_cam" />
+        <param name="io_method" value="mmap"/>
+        <param name="framerate" value="30" />
+        <remap from="usb_cam/image_raw" to="/camera/image_raw" />
+    </node>
+</launch>

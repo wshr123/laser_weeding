@@ -96,13 +96,13 @@
         <param name="min_stable_frames" value="1" />
 
         <!-- ========== 坐标变换模式选择 ========== -->
-        <!-- true: 使用3D几何变换, false: 使用简单线性映射（原始方法）-->
+        <!-- true: 使用3D几何变换, false: 使用简单线性映射-->
         <param name="use_3d_transform" value="true" />
 
         <!-- 3D变换配置文件路径（仅3D模式时需要）-->
         <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
     </node>
-    <!-- USB摄像头节点 -->
+<!--     USB摄像头节点 -->
     <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
         <param name="video_device" value="/dev/video4" />
         <param name="image_width" value="640" />
