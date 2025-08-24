@@ -502,8 +502,8 @@ class CameraGalvoTransform:
 
             # 若码值饱和，反向不可能严格还原；提示但继续计算
             max_code = self.params['galvo_params']['max_code']
-            if abs(galvo_x) >= max_code - 1 or abs(galvo_y) >= max_code - 1:
-                rospy.logwarn_throttle(1.0, "galvo_code appears saturated; reverse projection may be inaccurate")
+            # if abs(galvo_x) >= max_code - 1 or abs(galvo_y) >= max_code - 1:
+            #     rospy.logwarn_throttle(1.0, "galvo_code appears saturated; reverse projection may be inaccurate")
 
             intersection_point = self.choose_reverse_intersection(theta_x, theta_y)
             if intersection_point is None:
