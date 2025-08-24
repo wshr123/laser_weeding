@@ -650,10 +650,10 @@ class LaserWeedingNode:
                     cv2.putText(result, "PRED", (int(predicted_pos[0] + 10), int(predicted_pos[1])),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-        # 绘制振镜激光实际瞄准位置（使用正确的反向变换）
+        # 绘制振镜激光实际瞄准位置
         try:
             # 使用坐标变换器的反向变换方法
-            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
+            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel_3d(
                 self.galvo_position[0], self.galvo_position[1],
                 self.image_width, self.image_height
             )
