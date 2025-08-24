@@ -1,4 +1,4 @@
-# !/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 import numpy as np
@@ -13,9 +13,9 @@ class CameraGalvoTransform:
     """
     相机-振镜坐标变换类
     支持两种模式：
-    1. 3D几何变换：像素 → 相机光线 → 地面交点 → 振镜角度 → 码值
-       （可选：像素+深度 → 相机点 → 振镜点，优先使用）
-    2. 简单线性映射：像素直接线性映射到振镜码值（原始方法）
+    1) 3D几何变换：像素 → 相机光线/深度 → 振镜系点 → 振镜角 → 码值
+       反向：码值 → 振镜角 → 振镜射线 → 选择相同深度面/固定深度面/工作平面 → 相机像素
+    2) 简单线性映射（回退方案）
     """
 
     def __init__(self, config_file=None, use_3d_transform=True):
@@ -36,15 +36,15 @@ class CameraGalvoTransform:
             },
             'distortion_coeffs': [],
             'extrinsics': {
-                't_gc': [0.0, 100.0, -50.0],
-                'q_gc': [0.0, 0.0, 0.0, 1.0]
+                't_gc': [0.0, 100.0, -50.0],  # 相机在振镜坐标系的位置（mm）
+                'q_gc': [0.0, 0.0, 0.0, 1.0]  # 相机→振镜的旋转（xyzw）
             },
             'work_plane': {
-                'n_g': [0.0, 0.0, 1.0],
-                'd_g': -200.0
+                'n_g': [0.0, 0.0, 1.0],  # 振镜系下工作平面法向
+                'd_g': -200.0           # 平面方程 n·X + d = 0
             },
             'galvo_params': {
-                'scan_angle': 30.0,
+                'scan_angle': 30.0,  # 总扫描角（deg）
                 'scale_x': 1.0,
                 'scale_y': 1.0,
                 'bias_x': 0.0,
@@ -68,27 +68,24 @@ class CameraGalvoTransform:
 
         self.init_simple_mapping()
 
+        # 运行态变量
         self.last_pixel_pos = None
         self.last_galvo_pos = None
         self.transform_valid = True
         self.transform_method_used = "Unknown"
         self.transform_fail_count = 0
 
-        # 可选的深度查询函数
+        # 深度查询回调
         self.depth_query_func = None
 
-        # 新增：Y轴符号控制（影响3D路径的角度↔码值）
-        # 默认翻转为 True（-1.0），根据你的现象先这样；可通过 set_y_axis_invert 配置
-        self.y_sign = -1.0
+        # 反向回投时优先使用的“上一命中点”（来自像素+深度的正向分支）
+        self.last_hit_point_g = None  # 振镜系 [x,y,z] mm
+        # 可选的固定深度面（振镜系 z = const，单位 mm）
+        self.fixed_reverse_depth_z_mm = None
 
         rospy.loginfo("Camera-galvo coordinate transformer initialized successfully")
 
-    def set_y_axis_invert(self, invert):
-        """
-        设置Y轴是否翻转，仅作用于3D路径角度↔码值互换，确保正反一致。
-        invert=True -> y_sign = -1.0; invert=False -> y_sign = +1.0
-        """
-        self.y_sign = -1.0 if bool(invert) else +1.0
+    # -------------------- 参数与初始化 --------------------
 
     def load_config(self, config_file):
         self.params = self.default_params.copy()
@@ -143,27 +140,42 @@ class CameraGalvoTransform:
         self.D = np.array(self.params['distortion_coeffs'], dtype=np.float64)
         self.use_distortion = len(self.D) > 0
 
-        rospy.logdebug(f"Camera matrix K:\n{self.K}")
-
     def build_extrinsics(self):
         ext = self.params['extrinsics']
         self.t_gc = np.array(ext['t_gc'], dtype=np.float64)
         q = ext['q_gc']  # [x, y, z, w]
         self.R_gc = Rotation.from_quat(q).as_matrix()
-        rospy.logdebug(f"Camera position t_gc: {self.t_gc}")
-        rospy.logdebug(f"Camera orientation R_gc:\n{self.R_gc}")
+        # 约定：p_g = R_gc * p_c + t_gc
 
     def build_work_plane(self):
         plane = self.params['work_plane']
         self.n_g = np.array(plane['n_g'], dtype=np.float64)
         self.n_g = self.n_g / np.linalg.norm(self.n_g)
         self.d_g = float(plane['d_g'])
-        rospy.logdebug(f"Work plane normal: {self.n_g}")
-        rospy.logdebug(f"Work plane distance: {self.d_g}")
+
+    # -------------------- 公共 API --------------------
+
+    def set_depth_query(self, func):
+        """
+        设置像素深度查询回调。
+        func(u, v) -> depth_in_meters or None
+        """
+        self.depth_query_func = func
+
+    def set_fixed_depth_for_reverse(self, z_mm):
+        """
+        设置反向回投时的固定深度面（振镜坐标系 z = z_mm）。
+        若设为 None，则不使用固定深度优先级。
+        """
+        self.fixed_reverse_depth_z_mm = z_mm
 
     def pixel_to_galvo_code(self, pixel_x, pixel_y, image_width=640, image_height=480):
+        """
+        正向：像素 -> 码值
+        优先 3D；失败时按配置回退到简单映射
+        """
         try:
-            if self.use_3d_transform and hasattr(self, 'transform_3d_initialized') and self.transform_3d_initialized:
+            if self.use_3d_transform and getattr(self, 'transform_3d_initialized', False):
                 result = self.pixel_to_galvo_3d(pixel_x, pixel_y, image_width, image_height)
                 if result is not None:
                     self.transform_method_used = "3D geometric transform"
@@ -200,12 +212,21 @@ class CameraGalvoTransform:
             except:
                 return None
 
-    def set_depth_query(self, func):
+    def galvo_code_to_pixel(self, galvo_x, galvo_y, image_width=640, image_height=480):
         """
-        设置像素深度查询回调。
-        func(u, v) -> depth_in_meters or None
+        反向：码值 -> 像素
+        优先 3D；失败时回退到简单映射
         """
-        self.depth_query_func = func
+        try:
+            if self.use_3d_transform and getattr(self, 'transform_3d_initialized', False):
+                return self.galvo_code_to_pixel_3d(galvo_x, galvo_y, image_width, image_height)
+            else:
+                return self.galvo_code_to_pixel_simple(galvo_x, galvo_y, image_width, image_height)
+        except Exception as e:
+            rospy.logdebug(f"Reverse coordinate transform failed: {e}")
+            return self.galvo_code_to_pixel_simple(galvo_x, galvo_y, image_width, image_height)
+
+    # -------------------- 正向 3D --------------------
 
     def pixel_depth_to_point_galvo(self, pixel_x, pixel_y, depth_m):
         """
@@ -227,41 +248,111 @@ class CameraGalvoTransform:
         except Exception:
             return None
 
+    def pixel_to_camera_ray(self, pixel_x, pixel_y):
+        try:
+            if self.use_distortion:
+                # 如需去畸变，这里添加畸变模型反解
+                pass
+            x = (pixel_x - self.K[0, 2]) / self.K[0, 0]
+            y = (pixel_y - self.K[1, 2]) / self.K[1, 1]
+            ray_dir = np.array([x, y, 1.0], dtype=np.float64)
+            ray_dir = ray_dir / np.linalg.norm(ray_dir)
+            return ray_dir
+        except Exception as e:
+            rospy.logdebug(f"Failed to convert pixel to camera ray: {e}")
+            return None
+
+    def ray_plane_intersection(self, ray_origin, ray_direction):
+        try:
+            denominator = np.dot(self.n_g, ray_direction)
+            if abs(denominator) < 1e-6:
+                return None
+
+            t = -(np.dot(self.n_g, ray_origin) + self.d_g) / denominator
+            if t <= 0:
+                return None
+
+            intersection = ray_origin + t * ray_direction
+            return intersection
+        except Exception:
+            return None
+
+    def point_to_galvo_angles(self, point):
+        x, y, z = point
+        if abs(z) < 1e-9:
+            return 0.0, 0.0
+        theta_x = np.arctan2(x, z)
+        theta_y = np.arctan2(y, z)
+        return theta_x, theta_y
+
+    def angles_to_codes(self, theta_x, theta_y):
+        """
+        角度（弧度）→ 码值。仅在3D路径中使用。
+        """
+        galvo = self.params['galvo_params']
+        theta_x_deg = np.degrees(theta_x)
+        theta_y_deg = np.degrees(theta_y)
+
+        theta_x_corrected = theta_x_deg * galvo['scale_x'] + galvo['bias_x']
+        theta_y_corrected = theta_y_deg * galvo['scale_y'] + galvo['bias_y']
+
+        half_scan_angle = galvo['scan_angle'] / 2.0  # deg
+
+        norm_x = theta_x_corrected / half_scan_angle
+        norm_y = theta_y_corrected / half_scan_angle
+
+        code_x = norm_x * galvo['max_code']
+        code_y = norm_y * galvo['max_code']
+
+        max_code = galvo['max_code']
+        saturated = (abs(code_x) > max_code) or (abs(code_y) > max_code)
+        if saturated:
+            rospy.logwarn_throttle(1.0, "angles_to_codes saturated; visualization/roundtrip may be inaccurate")
+
+        code_x = np.clip(code_x, -max_code, max_code)
+        code_y = np.clip(code_y, -max_code, max_code)
+
+        return code_x, code_y
+
     def pixel_to_galvo_3d(self, pixel_x, pixel_y, image_width, image_height):
         try:
             # 优先使用深度
-            if hasattr(self, 'depth_query_func') and callable(self.depth_query_func):
+            if callable(getattr(self, 'depth_query_func', None)):
                 depth_m = self.depth_query_func(pixel_x, pixel_y)
                 if depth_m is not None and depth_m > 0:
                     point_g = self.pixel_depth_to_point_galvo(pixel_x, pixel_y, depth_m)
                     if point_g is not None:
+                        # 缓存命中点供反向回投使用（保持一致的深度面）
+                        self.last_hit_point_g = point_g.copy()
+
                         theta_x, theta_y = self.point_to_galvo_angles(point_g)
                         code_x, code_y = self.angles_to_codes(theta_x, theta_y)
+
                         self.last_pixel_pos = (pixel_x, pixel_y)
                         self.last_galvo_pos = (code_x, code_y)
                         return (int(code_x), int(code_y))
-            else:
-                # 无深度或失败则继续原有逻辑：光线与工作平面交点
-                ray_dir_camera = self.pixel_to_camera_ray(pixel_x, pixel_y)
-                if ray_dir_camera is None:
-                    rospy.logdebug("Failed at step 1: pixel to camera ray")
-                    return None
+            # 无深度或深度失败，则使用射线-工作平面交
+            ray_dir_camera = self.pixel_to_camera_ray(pixel_x, pixel_y)
+            if ray_dir_camera is None:
+                return None
 
-                ray_origin_galvo = self.t_gc
-                ray_dir_galvo = self.R_gc @ ray_dir_camera
+            ray_origin_galvo = self.t_gc
+            ray_dir_galvo = self.R_gc @ ray_dir_camera
 
-                intersection_point = self.ray_plane_intersection(ray_origin_galvo, ray_dir_galvo)
-                if intersection_point is None:
-                    rospy.logdebug("Failed at step 3: ray-plane intersection")
-                    return None
+            intersection_point = self.ray_plane_intersection(ray_origin_galvo, ray_dir_galvo)
+            if intersection_point is None:
+                return None
 
-                theta_x, theta_y = self.point_to_galvo_angles(intersection_point)
-                code_x, code_y = self.angles_to_codes(theta_x, theta_y)
+            # 也可以缓存，以便反向回投使用（但与深度得到的面不同）
+            self.last_hit_point_g = intersection_point.copy()
 
-                self.last_pixel_pos = (pixel_x, pixel_y)
-                self.last_galvo_pos = (code_x, code_y)
+            theta_x, theta_y = self.point_to_galvo_angles(intersection_point)
+            code_x, code_y = self.angles_to_codes(theta_x, theta_y)
 
-                return (int(code_x), int(code_y))
+            self.last_pixel_pos = (pixel_x, pixel_y)
+            self.last_galvo_pos = (code_x, code_y)
+
+            return (int(code_x), int(code_y))
 
         except Exception as e:
             rospy.logdebug(f"3D transform exception: {e}")
@@ -287,108 +378,143 @@ class CameraGalvoTransform:
         self.last_pixel_pos = (pixel_x, pixel_y)
         self.last_galvo_pos = (galvo_x, galvo_y)
 
-        rospy.logdebug(
-            f"Simple mapping: pixel({pixel_x:.1f},{pixel_y:.1f}) -> norm({norm_x:.3f},{norm_y:.3f}) -> codes({galvo_x:.0f},{galvo_y:.0f})")
-
         return (int(galvo_x), int(galvo_y))
 
-    def pixel_to_camera_ray(self, pixel_x, pixel_y):
-        try:
-            if self.use_distortion:
-                pass
-            x = (pixel_x - self.K[0, 2]) / self.K[0, 0]
-            y = (pixel_y - self.K[1, 2]) / self.K[1, 1]
-            ray_dir = np.array([x, y, 1.0], dtype=np.float64)
-            ray_dir = ray_dir / np.linalg.norm(ray_dir)
-            return ray_dir
-        except Exception as e:
-            rospy.logdebug(f"Failed to convert pixel to camera ray: {e}")
-            return None
+    # -------------------- 反向 3D（使用深度面优先） --------------------
 
-    def ray_plane_intersection(self, ray_origin, ray_direction):
-        try:
-            denominator = np.dot(self.n_g, ray_direction)
-            if abs(denominator) < 1e-6:
-                rospy.logdebug("Ray is parallel to the plane, no intersection")
-                return None
-
-            t = -(np.dot(self.n_g, ray_origin) + self.d_g) / denominator
-            if t <= 0:
-                rospy.logdebug(f"Intersection point is behind camera, t={t}")
-                return None
-
-            intersection = ray_origin + t * ray_direction
-            return intersection
-        except Exception as e:
-            rospy.logdebug(f"Failed to compute ray-plane intersection: {e}")
-            return None
-
-    def point_to_galvo_angles(self, point):
-        x, y, z = point
-        if abs(z) < 1e-6:
-            rospy.logdebug("Z coordinate too small, cannot compute angles")
-            return 0.0, 0.0
-        theta_x = np.arctan2(x, z)
-        theta_y = np.arctan2(y, z)
-        return theta_x, theta_y
-
-    def angles_to_codes(self, theta_x, theta_y):
+    def codes_to_angles(self, code_x, code_y):
         """
-        角度（弧度）→ 码值。仅在3D路径中使用。Y轴附加 y_sign 以统一正反向。
+        码值 → 角度（弧度）。与 angles_to_codes 互逆（在未饱和前提下）。
         """
         galvo = self.params['galvo_params']
-        theta_x_deg = np.degrees(theta_x)
-        theta_y_deg = np.degrees(theta_y)
-
-        theta_x_corrected = theta_x_deg * galvo['scale_x'] + galvo['bias_x']
-        theta_y_corrected = (theta_y_deg * galvo['scale_y'] + galvo['bias_y']) * self.y_sign
-
-        half_scan_angle = galvo['scan_angle'] / 2.0
-
-        norm_x = theta_x_corrected / half_scan_angle
-        norm_y = theta_y_corrected / half_scan_angle
-
-        code_x = norm_x * galvo['max_code']
-        code_y = norm_y * galvo['max_code']
-
         max_code = galvo['max_code']
-        code_x = np.clip(code_x, -max_code, max_code)
-        code_y = np.clip(code_y, -max_code, max_code)
 
-        return code_x, code_y
+        norm_x = code_x / max_code
+        norm_y = code_y / max_code
 
-    def galvo_code_to_pixel(self, galvo_x, galvo_y, image_width=640, image_height=480):
+        half_scan_angle = galvo['scan_angle'] / 2.0  # deg
+
+        theta_x_corrected = norm_x * half_scan_angle
+        theta_y_corrected = norm_y * half_scan_angle
+
+        theta_x_deg = (theta_x_corrected - galvo['bias_x']) / galvo['scale_x']
+        theta_y_deg = (theta_y_corrected - galvo['bias_y']) / galvo['scale_y']
+
+        theta_x = np.radians(theta_x_deg)
+        theta_y = np.radians(theta_y_deg)
+
+        return theta_x, theta_y
+
+    def galvo_angles_to_point_on_plane(self, theta_x, theta_y):
+        """
+        用工作平面求交点。
+        """
         try:
-            if self.use_3d_transform and hasattr(self, 'transform_3d_initialized') and self.transform_3d_initialized:
-                return self.galvo_code_to_pixel_3d(galvo_x, galvo_y, image_width, image_height)
-            else:
-                return self.galvo_code_to_pixel_simple(galvo_x, galvo_y, image_width, image_height)
-        except Exception as e:
-            rospy.logdebug(f"Reverse coordinate transform failed: {e}")
-            return self.galvo_code_to_pixel_simple(galvo_x, galvo_y, image_width, image_height)
+            x = np.tan(theta_x)
+            y = np.tan(theta_y)
+            z = 1.0
+            dir_g = np.array([x, y, z], dtype=np.float64)
+            dir_g /= np.linalg.norm(dir_g)
+            org_g = np.zeros(3, dtype=np.float64)
+            return self.ray_plane_intersection(org_g, dir_g)
+        except Exception:
+            return None
+
+    def galvo_angles_to_point_at_depth(self, theta_x, theta_y, z_ref_mm):
+        """
+        用固定深度面 z = z_ref_mm（振镜系）求交点。
+        """
+        try:
+            x = np.tan(theta_x)
+            y = np.tan(theta_y)
+            z = 1.0
+            dir_g = np.array([x, y, z], dtype=np.float64)
+            dir_g /= np.linalg.norm(dir_g)
+            org_g = np.zeros(3, dtype=np.float64)
+
+            if abs(dir_g[2]) < 1e-9:
+                return None
+            t = (z_ref_mm - org_g[2]) / dir_g[2]
+            if t <= 0:
+                return None
+            return org_g + t * dir_g
+        except Exception:
+            return None
+
+    def choose_reverse_intersection(self, theta_x, theta_y):
+        """
+        反向回投的交点选择：
+        1) 如果有 last_hit_point_g，优先在相同 z 面上取交点（保持与正向深度一致）
+        2) 如果配置了固定深度 fixed_reverse_depth_z_mm，使用它
+        3) 否则回退到工作平面
+        返回：intersection_point_g 或 None
+        """
+        # 1) 上一次正向命中的深度（来自像素+深度路径或平面交）
+        if isinstance(self.last_hit_point_g, np.ndarray) and self.last_hit_point_g.shape == (3,):
+            z_ref = float(self.last_hit_point_g[2])
+            p = self.galvo_angles_to_point_at_depth(theta_x, theta_y, z_ref)
+            if p is not None:
+                return p
+
+        # 2) 固定深度
+        if self.fixed_reverse_depth_z_mm is not None:
+            p = self.galvo_angles_to_point_at_depth(theta_x, theta_y, float(self.fixed_reverse_depth_z_mm))
+            if p is not None:
+                return p
+
+        # 3) 工作平面
+        return self.galvo_angles_to_point_on_plane(theta_x, theta_y)
+
+    def point_to_camera_ray(self, point_g):
+        """
+        振镜系点 → 相机系视线方向
+        """
+        try:
+            camera_to_point = point_g - self.t_gc
+            camera_to_point = camera_to_point / np.linalg.norm(camera_to_point)
+            ray_dir_camera = self.R_gc.T @ camera_to_point
+            return ray_dir_camera
+        except Exception:
+            return None
+
+    def camera_ray_to_pixel(self, ray_direction, image_width, image_height):
+        try:
+            if abs(ray_direction[2]) < 1e-9:
+                return None
+
+            x = ray_direction[0] / ray_direction[2]
+            y = ray_direction[1] / ray_direction[2]
+
+            pixel_x = x * self.K[0, 0] + self.K[0, 2]
+            pixel_y = y * self.K[1, 1] + self.K[1, 2]
+
+            # 如需加畸变投影，在此处处理
+            return (pixel_x, pixel_y)
+        except Exception:
+            return None
 
     def galvo_code_to_pixel_3d(self, galvo_x, galvo_y, image_width, image_height):
+        """
+        使用“深度优先”的反向回投：码值 -> 角度 -> 选择交点（同深度/固定深度/工作平面）-> 投影到像素
+        """
         try:
             theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
-            intersection_point = self.galvo_angles_to_point(theta_x, theta_y)
+
+            # 若码值饱和，反向不可能严格还原；提示但继续计算
+            max_code = self.params['galvo_params']['max_code']
+            if abs(galvo_x) >= max_code - 1 or abs(galvo_y) >= max_code - 1:
+                rospy.logwarn_throttle(1.0, "galvo_code appears saturated; reverse projection may be inaccurate")
+
+            intersection_point = self.choose_reverse_intersection(theta_x, theta_y)
             if intersection_point is None:
-                rospy.logdebug("Failed to compute intersection point from galvo angles")
                 return None
 
             ray_dir_camera = self.point_to_camera_ray(intersection_point)
             if ray_dir_camera is None:
-                rospy.logdebug("Failed to compute camera ray from intersection point")
                 return None
 
             pixel = self.camera_ray_to_pixel(ray_dir_camera, image_width, image_height)
-            if pixel is None:
-                return None
-            pixel_x, pixel_y = pixel
-
-            rospy.logdebug(
-                f"3D reverse transform: codes({galvo_x:.0f},{galvo_y:.0f}) -> pixel({pixel_x:.1f},{pixel_y:.1f})")
-
-            return (pixel_x, pixel_y)
+            return pixel
 
         except Exception as e:
             rospy.logdebug(f"3D reverse transform exception: {e}")
@@ -411,77 +537,9 @@ class CameraGalvoTransform:
         pixel_x = (norm_x + 0.5) * image_width
         pixel_y = (norm_y + 0.5) * image_height
 
-        rospy.logdebug(
-            f"Simple reverse mapping: codes({galvo_x:.0f},{galvo_y:.0f}) -> norm({norm_x:.3f},{norm_y:.3f}) -> pixel({pixel_x:.1f},{pixel_y:.1f})")
-
         return (pixel_x, pixel_y)
 
-    def codes_to_angles(self, code_x, code_y):
-        """
-        码值 → 角度（弧度）。仅在3D路径中使用。与 angles_to_codes 完全互逆，Y轴应用 y_sign 的反向补偿。
-        """
-        galvo = self.params['galvo_params']
-        max_code = galvo['max_code']
-
-        norm_x = code_x / max_code
-        norm_y = code_y / max_code
-
-        half_scan_angle = galvo['scan_angle'] / 2.0
-
-        theta_x_corrected = norm_x * half_scan_angle
-        theta_y_corrected = norm_y * half_scan_angle
-
-        theta_x_deg = (theta_x_corrected - galvo['bias_x']) / galvo['scale_x']
-        theta_y_deg = ((theta_y_corrected) / self.y_sign - galvo['bias_y']) / galvo['scale_y']
-
-        theta_x = np.radians(theta_x_deg)
-        theta_y = np.radians(theta_y_deg)
-
-        return theta_x, theta_y
-
-    def galvo_angles_to_point(self, theta_x, theta_y):
-        try:
-            x = np.tan(theta_x)
-            y = np.tan(theta_y)
-            z = 1.0
-            ray_direction = np.array([x, y, z], dtype=np.float64)
-            ray_direction = ray_direction / np.linalg.norm(ray_direction)
-            ray_origin = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-            intersection = self.ray_plane_intersection(ray_origin, ray_direction)
-            return intersection
-        except Exception as e:
-            rospy.logdebug(f"Failed to compute point from galvo angles: {e}")
-            return None
-
-    def point_to_camera_ray(self, point):
-        try:
-            camera_to_point = point - self.t_gc
-            camera_to_point = camera_to_point / np.linalg.norm(camera_to_point)
-            ray_dir_camera = self.R_gc.T @ camera_to_point
-            return ray_dir_camera
-        except Exception as e:
-            rospy.logdebug(f"Failed to compute camera ray from point: {e}")
-            return None
-
-    def camera_ray_to_pixel(self, ray_direction, image_width, image_height):
-        try:
-            if abs(ray_direction[2]) < 1e-6:
-                rospy.logdebug("Ray direction z component too small")
-                return None
-
-            x = ray_direction[0] / ray_direction[2]
-            y = ray_direction[1] / ray_direction[2]
-
-            pixel_x = x * self.K[0, 0] + self.K[0, 2]
-            pixel_y = y * self.K[1, 1] + self.K[1, 2]
-
-            if self.use_distortion:
-                pass
-
-            return (pixel_x, pixel_y)
-        except Exception as e:
-            rospy.logdebug(f"Failed to convert camera ray to pixel: {e}")
-            return None
+    # -------------------- 模式切换/工具 --------------------
 
     def switch_transform_mode(self, use_3d_transform):
         old_mode = "3D geometric transform" if self.use_3d_transform else "Simple linear mapping"
@@ -490,7 +548,7 @@ class CameraGalvoTransform:
         self.use_3d_transform = use_3d_transform
         self.params['transform_mode']['use_3d_transform'] = use_3d_transform
 
-        if use_3d_transform and not hasattr(self, 'transform_3d_initialized'):
+        if use_3d_transform and not getattr(self, 'transform_3d_initialized', False):
             self.init_3d_transform()
 
         self.transform_fail_count = 0
@@ -516,14 +574,13 @@ class CameraGalvoTransform:
             rospy.logwarn(f"Failed to update camera intrinsics from CameraInfo: {e}")
 
     def calibrate_with_points(self, pixel_points, galvo_points):
+        # 这里保留接口；实际标定流程视你的需求实现
         if len(pixel_points) != len(galvo_points) or len(pixel_points) < 4:
             rospy.logerr("Calibration requires at least 4 corresponding points")
             return False
-
         try:
-            rospy.loginfo(f"Calibrating with {len(pixel_points)} point pairs")
+            rospy.loginfo(f"Calibrating with {len(pixel_points)} point pairs (placeholder)")
             return True
-
         except Exception as e:
             rospy.logerr(f"Calibration failed: {e}")
             return False
@@ -547,7 +604,8 @@ class CameraGalvoTransform:
             'use_3d_transform': self.use_3d_transform,
             'transform_fail_count': getattr(self, 'transform_fail_count', 0),
             'galvo_params': self.params['galvo_params'],
-            'simple_mapping': self.params['simple_mapping']
+            'simple_mapping': self.params['simple_mapping'],
+            'fixed_reverse_depth_z_mm': self.fixed_reverse_depth_z_mm
         }
 
         if self.use_3d_transform and hasattr(self, 't_gc'):
@@ -561,10 +619,8 @@ class CameraGalvoTransform:
         return info
 
 
-# 示例配置保留
+# 示例配置（可选）
 EXAMPLE_CONFIG = """
-# 相机-振镜坐标变换配置文件
-
 transform_mode:
   use_3d_transform: true
   fallback_to_simple: true
@@ -602,7 +658,6 @@ simple_mapping:
   offset_y: 0
 """
 
-
 def create_example_config(file_path):
     with open(file_path, 'w') as f:
         f.write(EXAMPLE_CONFIG)
@@ -616,14 +671,14 @@ if __name__ == "__main__":
         config_path = sys.argv[2] if len(sys.argv) > 2 else "camera_galvo_config.yaml"
         create_example_config(config_path)
     else:
-        print("Testing 3D geometric transform:")
-        transform_3d = CameraGalvoTransform(use_3d_transform=True)
-
-        print("\nTesting simple linear mapping:")
-        transform_simple = CameraGalvoTransform(use_3d_transform=False)
-
+        print("Testing 3D geometric transform with depth-aware reverse...")
+        t = CameraGalvoTransform(use_3d_transform=True)
+        # 可选：固定反向深度
+        # t.set_fixed_depth_for_reverse(241.0)
         test_points = [(320, 240), (100, 100), (540, 380)]
         for px, py in test_points:
-            result_3d = transform_3d.pixel_to_galvo_code(px, py)
-            result_simple = transform_simple.pixel_to_galvo_code(px, py)
-            print(f"Pixel({px}, {py}) -> 3D transform{result_3d} | Simple mapping{result_simple}")
+            res = t.pixel_to_galvo_code(px, py)
+            print("p2g:", (px, py), "->", res)
+            if res:
+                uv = t.galvo_code_to_pixel(res[0], res[1])
+                print("g2p:", res, "->", uv)
