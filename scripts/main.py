@@ -174,12 +174,28 @@ class LaserWeedingNode:
             )
 
             # 标定和控制相关订阅器
-            self.calibration_sub = rospy.Subscriber(
-                '/calibration_command',
-                String,
-                self.calibration_callback,
-                queue_size=1
+            # self.calibration_sub = rospy.Subscriber(
+            #     '/calibration_command',
+            #     String,
+            #     self.calibration_callback,
+            #     queue_size=1
+            # )
+
+            # 深度图订阅  注入 depth_query_func
+            self.depth_image = None
+            self.depth_image_encoding = None
+            self.depth_image_lock = threading.Lock()
+            depth_topic = rospy.get_param("~depth_topic", "/camera/aligned_depth_to_color/image_raw")
+            self.depth_sub = rospy.Subscriber(
+                depth_topic,
+                Image,
+                self.depth_image_callback,
+                queue_size=1,
+                buff_size=2 ** 24
             )
+            rospy.loginfo(f"subscribed to depth topic: {depth_topic}")
+            # 设置 query 函数给变换器
+            self.coordinate_transform.set_depth_query(self.depth_query_func)
 
             # ========== 启动控制线程 ==========
             self.galvo_thread = threading.Thread(target=self.galvo_control_loop)
@@ -248,7 +264,7 @@ class LaserWeedingNode:
     def control_loop(self, event):
         try:
             current_time = time.time()
-
+            # self.update_position_history([640,360], current_time)  #for test
             if self.system_state == SystemState.IDLE:
                 # 进入空闲状态时，重新挑选队列：只保留“在扫描范围内”的目标，并按“距离中心”排序
                 candidates = []
@@ -341,6 +357,38 @@ class LaserWeedingNode:
         except Exception as e:
             rospy.logerr(f"control loop failed: {e}")
 
+    def depth_image_callback(self, msg):
+        """深度图回调：自动缓存为 numpy 格式 米"""
+        try:
+            depth_cv = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            if msg.encoding == '16UC1':
+                depth_m = depth_cv.astype(np.float32) / 1000.0
+            elif msg.encoding == '32FC1':
+                depth_m = depth_cv.astype(np.float32)
+            else:
+                rospy.logwarn_throttle(5.0, f"[depth] unsupported encoding: {msg.encoding}")
+                return
+
+            with self.depth_image_lock:
+                self.depth_image = depth_m
+                self.depth_image_encoding = msg.encoding
+
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[depth] failed to convert: {e}")
+
+    def depth_query_func(self, u, v):
+        """查询像素(u,v)的深度，单位：米。用于 coordinate_transform 中"""
+        with self.depth_image_lock:
+            if self.depth_image is None:
+                return None
+            H, W = self.depth_image.shape[:2]
+            if u < 0 or v < 0 or u >= W or v >= H:
+                return None
+            z = float(self.depth_image[int(round(v)), int(round(u))])
+            if not np.isfinite(z) or z <= 0:
+                return None
+            return z
+
     def in_galvo_scan_range(self, u, v):
         """判断像素点是否在振镜扫描范围内：用几何模型映射到码值并检查范围"""
         try:
@@ -353,28 +401,6 @@ class LaserWeedingNode:
             return (self.galvo_min <= x <= self.galvo_max) and (self.galvo_min <= y <= self.galvo_max)
         except Exception:
             return False
-
-    def calibration_callback(self, msg):
-        """标定命令回调"""
-        try:
-            command_data = json.loads(msg.data)
-            command = command_data.get('command', '')
-
-            if command == 'calibrate':
-                pixel_points = command_data.get('pixel_points', [])
-                galvo_points = command_data.get('galvo_points', [])
-
-                if self.coordinate_transform.calibrate_with_points(pixel_points, galvo_points):
-                    pass
-                else:
-                    rospy.logerr("failed calibration coordinate")
-
-            elif command == 'save_config':
-                config_file = command_data.get('file', 'current_config.yaml')
-                self.coordinate_transform.save_config(config_file)
-
-        except Exception as e:
-            rospy.logerr(f"failed calibration coordinate: {e}")
 
     def init_kalman_filter(self):
         """初始化简单的2D卡尔曼滤波器（位置+速度）"""
@@ -470,8 +496,7 @@ class LaserWeedingNode:
 
             if distance > self.max_prediction_distance:
                 predicted_pos = current_pos
-
-            # 使用坐标变换（自动选择3D或简单模式）
+            # 使用坐标变换
             galvo_result = self.coordinate_transform.pixel_to_galvo_code(
                 predicted_pos[0], predicted_pos[1],
                 self.image_width, self.image_height
@@ -504,7 +529,7 @@ class LaserWeedingNode:
             except Exception as e:
                 rospy.logdebug(f"kalman predict failed: {e}")
 
-        # 简单线性预测（备用方案）
+        # 简单线性预测
         if len(self.position_history) >= 2:
             p1 = self.position_history[-2]
             p2 = self.position_history[-1]
@@ -533,7 +558,6 @@ class LaserWeedingNode:
                 dx = target_pos[0] - self.galvo_position[0]
                 dy = target_pos[1] - self.galvo_position[1]
                 distance = np.hypot(dx, dy)
-
                 if distance > self.min_move_step:
                     if self.galvo_controller:
                         self.galvo_controller.move_to_position(
@@ -628,18 +652,18 @@ class LaserWeedingNode:
             cv2.putText(result, label, (int(x), int(y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-            # 当前目标的预测瞄准点
-            if track_id == (self.current_target['id'] if self.current_target else None):
-                predicted_pos = self.predict_position(self.prediction_time)
-                if predicted_pos:
-                    cv2.circle(result, (int(predicted_pos[0]), int(predicted_pos[1])),
-                               6, (255, 0, 255), 2)
-                    cv2.putText(result, "PRED", (int(predicted_pos[0] + 10), int(predicted_pos[1])),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            # # 当前目标的预测瞄准点
+            # if track_id == (self.current_target['id'] if self.current_target else None):
+            #     predicted_pos = self.predict_position(self.prediction_time)
+            #     if predicted_pos:
+            #         cv2.circle(result, (int(predicted_pos[0]), int(predicted_pos[1])),
+            #                    6, (255, 0, 255), 2)
+            #         cv2.putText(result, "PRED", (int(predicted_pos[0] + 10), int(predicted_pos[1])),
+            #                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-        # 绘制振镜激光实际瞄准位置（反投：码值→像素）
+        # 绘制振镜激光实际瞄准位置
         try:
-            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel_3d(
+            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
                 self.galvo_position[0], self.galvo_position[1],
                 self.image_width, self.image_height
             )
@@ -655,11 +679,11 @@ class LaserWeedingNode:
 
                 laser_status = "LASER ON" if self.laser_on else "AIM"
                 cv2.putText(result, laser_status, (xg + 20, yg - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
                 coord_text = f"({self.galvo_position[0]:.0f},{self.galvo_position[1]:.0f})"
                 cv2.putText(result, coord_text, (xg + 20, yg + 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
             else:
                 cv2.putText(result, "GALVO POS UNKNOWN", (10, 150),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)

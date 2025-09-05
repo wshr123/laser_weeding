@@ -24,11 +24,11 @@ class XY2_100Controller:
 
         # XY2-100协议参数
         self.max_value = 65535
-        self.center_value = 32768
+        self.center_value = 32767
 
         # 振镜工作范围
         self.scan_angle = 30
-        self.field_size = 100
+        # self.field_size = 100
 
         # 当前位置
         self.current_x = self.center_value
@@ -102,19 +102,21 @@ class XY2_100Controller:
     def move_to_position(self, x, y):
         """移动振镜到指定位置 (支持0-65535和有符号格式)"""
         # 如果输入是0-65535格式，转换为有符号格式
-        if x > 32767:
-            x = x - 65536
-        if y > 32767:
-            y = y - 65536
+        # if x > 32767:
+        #     x = x - 65536
+        # if y > 32767:
+        #     y = y - 65536
 
-        # 限制范围到±32767
+        # 限制范围到±32767 teensy里规定的y是x，x是y
         x = max(-32767, min(32767, int(x)))
         y = max(-32767, min(32767, int(y)))
-
+        # x = -x
+        # print(x,y)
         command = f"XY:{x},{y}"
+        # print(command)
         if self.send_command(command):
-            self.current_x = x
-            self.current_y = y
+            self.current_x = y
+            self.current_y = x
 
     def move_to_center(self):
         """移动到中心位置"""
@@ -132,38 +134,38 @@ class XY2_100Controller:
         if self.send_command(command):
             self.laser_enabled = False
 
-    def pixel_to_galvo(self, pixel_x, pixel_y, image_width=640, image_height=480):
-        """将像素坐标转换为振镜坐标"""
-        # 归一化到0-1范围
-        norm_x = pixel_x / image_width
-        norm_y = pixel_y / image_height
+    # def pixel_to_galvo(self, pixel_x, pixel_y, image_width=640, image_height=480):
+    #     """将像素坐标转换为振镜坐标"""
+    #     # 归一化到0-1范围
+    #     norm_x = pixel_x / image_width
+    #     norm_y = pixel_y / image_height
+    #
+    #     # 转换到有符号振镜坐标系 (-30000 to 30000)
+    #     galvo_x = int((norm_x - 0.5) * 65535)  # -30000 to 30000
+    #     galvo_y = int((norm_y - 0.5) * 65535)  # -30000 to 30000
 
-        # 转换到有符号振镜坐标系 (-30000 to 30000)
-        galvo_x = int((norm_x - 0.5) * 65535)  # -30000 to 30000
-        galvo_y = int((norm_y - 0.5) * 65535)  # -30000 to 30000
+        # return galvo_x, galvo_y
 
-        return galvo_x, galvo_y
-
-    def weed_elimination(self, weed_x, weed_y, duration=0.1):
-        """消除杂草"""
-        rospy.loginfo(f"Eliminating weed at position ({weed_x}, {weed_y})")
-
-        # 移动到杂草位置
-        self.move_to_position(weed_x, weed_y)
-
-        # 等待振镜稳定
-        time.sleep(0.05)
-
-        # 打开激光
-        self.laser_on()
-
-        # 保持激光
-        time.sleep(duration)
-
-        # 关闭激光
-        self.laser_off()
-
-        rospy.loginfo("Weed elimination completed")
+    # def weed_elimination(self, weed_x, weed_y, duration=0.1):
+    #     """消除杂草"""
+    #     rospy.loginfo(f"Eliminating weed at position ({weed_x}, {weed_y})")
+    #
+    #     # 移动到杂草位置
+    #     self.move_to_position(weed_x, weed_y)
+    #
+    #     # 等待振镜稳定
+    #     time.sleep(0.05)
+    #
+    #     # 打开激光
+    #     self.laser_on()
+    #
+    #     # 保持激光
+    #     time.sleep(duration)
+    #
+    #     # 关闭激光
+    #     self.laser_off()
+    #
+    #     rospy.loginfo("Weed elimination completed")
 
     def close(self):
         """关闭连接"""
