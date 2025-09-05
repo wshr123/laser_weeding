@@ -1,32 +1,62 @@
-<!-- manual_galvo_calibration.launch -->
 <launch>
+    <env name="LRS_LOG_LEVEL" value="ERROR"/>
+    <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+      <arg name="align_depth" value="true"/>
+      <arg name="enable_pointcloud" value="false"/>
+      <arg name="enable_sync" value="false"/>
+      <arg name="camera" value="camera"/>
+
+      <arg name="color_width"  value="1280"/>
+      <arg name="color_height" value="720"/>
+      <arg name="color_fps"    value="30"/>
+      <arg name="depth_width"  value="1280"/>
+      <arg name="depth_height" value="720"/>
+      <arg name="depth_fps"    value="30"/>
+
+      <arg name="initial_reset" value="false"/>
+    </include>
+
     <!-- 手动振镜校准节点 -->
-    <node pkg="laser_weeding" type="galvo_calibrator.py" name="manual_galvo_calibration_node" output="screen">
-        <!-- 振镜参数 -->
+    <node pkg="laser_weeding" type="galvo_calibrator_depth.py" name="manual_galvo_calibration_node" output="screen">
+        <!-- 振镜串口参数 -->
         <param name="serial_port" value="/dev/ttyACM0" />
         <param name="serial_baudrate" value="115200" />
 
         <!-- 坐标变换配置 -->
+        <param name="use_3d_transform" value="true" />
         <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
 
         <!-- 图像参数 -->
-        <param name="image_width" value="640" />
-        <param name="image_height" value="480" />
-        <param name="image_topic" value="/camera/image_raw" />
+        <param name="image_width" value="1280" />
+        <param name="image_height" value="720" />
+        <param name="image_topic" value="'/camera/color/image_raw'" />
 
         <!-- 校准结果保存 -->
         <param name="calibration_result_file" value="$(find laser_weeding)/yaml/manual_galvo_calibration.yaml" />
+
+<!--          --><!-- === 控制侧轴适配 === -->
+<!--         <param name="swap_axes" value="false" /> -->
+<!--         <param name="invert_x"  value="false" /> -->
+<!--         <param name="invert_y"  value="false" /> -->
+
+<!--          --><!-- === 仅可视化叠加的适配 === -->
+<!--         <param name="visual_swap_axes" value="false" /> -->
+<!--         <param name="visual_invert_x"  value="false" /> -->
+<!--         <param name="visual_invert_y"  value="false" /> -->
+
     </node>
 
-    <!-- USB摄像头节点 -->
-    <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen">
-        <param name="video_device" value="/dev/video4" />
-        <param name="image_width" value="640" />
-        <param name="image_height" value="480" />
-        <param name="pixel_format" value="yuyv" />
-        <param name="camera_frame_id" value="usb_cam" />
-        <param name="io_method" value="mmap"/>
-        <param name="framerate" value="30" />
-        <remap from="usb_cam/image_raw" to="/camera/image_raw" />
-    </node>
+<!--     USB摄像头节点 -->
+<!--     <node pkg="usb_cam" type="usb_cam_node" name="usb_cam" output="screen"> -->
+<!--         <param name="video_device" value="/dev/video4" /> -->
+<!--         <param name="image_width" value="1280" /> -->
+<!--         <param name="image_height" value="720" /> -->
+<!--         <param name="pixel_format" value="yuyv" /> -->
+<!--         <param name="camera_frame_id" value="usb_cam" /> -->
+<!--         <param name="io_method" value="mmap"/> -->
+<!--         <param name="framerate" value="30" /> -->
+<!--         <remap from="usb_cam/image_raw" to="/camera/image_raw" /> -->
+<!--     </node> -->
 </launch>
+
+<!-- #run rostopic pub /manual_calibration_command std_msgs/String "data: 'start'" in another termianl -->
