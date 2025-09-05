@@ -177,8 +177,8 @@ class CameraGalvoTransform:
     def pixel_to_galvo_code(self, pixel_x, pixel_y, image_width=640, image_height=480):
 
         try:
-            pixel_x = 640
-            pixel_y = 407  # 407
+            # pixel_x = 640
+            # pixel_y = 407  # 407
             if self.use_3d_transform and getattr(self, 'transform_3d_initialized', False):
 
                 result = self.pixel_to_galvo_3d(pixel_x, pixel_y, image_width, image_height)
@@ -330,10 +330,10 @@ class CameraGalvoTransform:
                 # print(depth_m)
                 if depth_m is not None and depth_m > 0:
 
-                    depth_m = 0.455 #0.455
+                    # depth_m = 0.455 #0.455
                     point_g = self.pixel_depth_to_point_galvo(pixel_x, pixel_y, depth_m)
-                    print("pixel x,y,depth",pixel_x,pixel_y,depth_m)
-                    print("point_g ",point_g)
+                    # print("pixel x,y,depth",pixel_x,pixel_y,depth_m)
+                    # print("point_g ",point_g)
                     if point_g is not None:
                         # 缓存命中点供反向映射使用 todo
                         self.last_hit_point_g = point_g.copy()
@@ -342,7 +342,7 @@ class CameraGalvoTransform:
                         code_x, code_y = self.angles_to_codes(theta_x, theta_y)
                         self.last_pixel_pos = (pixel_x, pixel_y)
                         self.last_galvo_pos = (code_x, code_y)
-                        print("codex,codey",code_x,code_y)
+                        # print("codex,codey",code_x,code_y)
                         return (int(code_x), int(code_y))
 
             # 无深度或深度失败，使用给定深度
@@ -519,7 +519,7 @@ class CameraGalvoTransform:
         code -> 角度 -> 交点-> pixel
         """
         try:
-            print("galvo x,y", galvo_x, galvo_y)
+            # print("galvo x,y", galvo_x, galvo_y)
             theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
             # print("galvo 2 pixel thetax,y",theta_x,theta_y)
             max_code = self.params['galvo_params']['max_code']
@@ -527,17 +527,17 @@ class CameraGalvoTransform:
             #     rospy.logwarn_throttle(1.0, "galvo_code appears saturated; reverse projection may be inaccurate")
 
             intersection_point = self.choose_reverse_intersection(theta_x, theta_y)
-            print("cam_p ",intersection_point)
+            # print("cam_p ",intersection_point)
             if intersection_point is None:
                 return None
 
             p_gc = self.point_to_camera_ray(intersection_point)
-            print("p_gc",p_gc)
+            # print("p_gc",p_gc)
             if p_gc is None:
                 return None
 
             pixel = self.camera_ray_to_pixel(p_gc, image_width, image_height)
-            print("pixel ",pixel)
+            # print("pixel ",pixel)
             return pixel
 
         except Exception as e:
