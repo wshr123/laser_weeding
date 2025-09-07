@@ -662,7 +662,7 @@ class LaserWeedingNode:
             #                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
         # 绘制振镜激光实际瞄准位置
-        try:
+        try:    #最开始是因为没有读到深度,用的是给定的深度值,所以可视化中瞄准的不准确
             galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
                 self.galvo_position[0], self.galvo_position[1],
                 self.image_width, self.image_height
@@ -682,7 +682,10 @@ class LaserWeedingNode:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
                 coord_text = f"({self.galvo_position[0]:.0f},{self.galvo_position[1]:.0f})"
+                pixel_text = f"{xg:.0f},{yg:.0f}"
                 cv2.putText(result, coord_text, (xg + 20, yg + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                cv2.putText(result, pixel_text, (xg + 20, yg + 35),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
             else:
                 cv2.putText(result, "GALVO POS UNKNOWN", (10, 150),

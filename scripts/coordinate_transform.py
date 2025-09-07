@@ -335,7 +335,7 @@ class CameraGalvoTransform:
                     # print("pixel x,y,depth",pixel_x,pixel_y,depth_m)
                     # print("point_g ",point_g)
                     if point_g is not None:
-                        # 缓存命中点供反向映射使用 todo
+                        # 缓存命中点供反向映射使用
                         self.last_hit_point_g = point_g.copy()
 
                         theta_x, theta_y = self.point_to_galvo_angles(point_g)
@@ -490,7 +490,7 @@ class CameraGalvoTransform:
         try:
             xg, yg, zg =  self.t_gc[0], self.t_gc[1], self.t_gc[2]
             t_cg = [xg, -yg, zg]
-            # print("t_gc:",self.t_gc)
+            # print("t_g:",self.t_gc)
             camera_to_point = point_g #- self.t_gc
             # print("camera 2 point1",camera_to_point)
             # camera_to_point = camera_to_point / np.linalg.norm(camera_to_point)
@@ -629,11 +629,11 @@ if __name__ == "__main__":
     print("Testing 3D geometric transform with depth-aware reverse...")
     t = CameraGalvoTransform(use_3d_transform=True)
     # 可选：固定反向深度
-    t.set_fixed_depth_for_reverse(300.0)
-    test_points = [(320, 240)]
+    t.set_fixed_depth_for_reverse(500.0)
+    test_points = [(640, 407)]
     for px, py in test_points:
         res = t.galvo_code_to_pixel(px, py)
         print("p2g:", (px, py), "->", res)
-        # if res:
-        #     uv = t.galvo_code_to_pixel(res[0], res[1])
-        #     print("g2p:", res, "->", uv)
+        if res:
+            uv = t.galvo_code_to_pixel(res[0], res[1])
+            print("g2p:", res, "->", uv)

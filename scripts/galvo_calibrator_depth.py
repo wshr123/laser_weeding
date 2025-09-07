@@ -15,6 +15,7 @@ import json
 import threading
 import signal
 import sys
+from scipy.spatial.transform import Rotation
 
 # 自有模块
 from coordinate_transform import CameraGalvoTransform
@@ -45,7 +46,7 @@ class ManualGalvoCalibrationNode:
         # self.visual_invert_y  = rospy.get_param('~visual_invert_y', False)
         # rospy.loginfo(f"[Visual Overlay] swap={self.visual_swap_axes}, invx={self.visual_invert_x}, invy={self.visual_invert_y}")
 
-        # ========== 坐标变换器 ==========
+        # ========== 坐标变换 ==========
         try:
             self.coordinate_transform = CameraGalvoTransform(
                 config_file=self.transform_config_file,
@@ -56,7 +57,7 @@ class ManualGalvoCalibrationNode:
             rospy.logerr(f"Failed to initialize coordinate transformer: {e}")
             raise
 
-        # ========== 振镜控制器 ==========
+        # ========== 振镜控制 ==========
         try:
             self.galvo_controller = XY2_100Controller(
                 port=self.serial_port,
@@ -79,7 +80,7 @@ class ManualGalvoCalibrationNode:
         self.current_image = None
         self.first_frame_synced = False  # 首帧同步宽高
 
-        # 绿色检测参数（Realsense 一般偏黄/绿，这个范围更宽）
+        # 绿色检测参数
         self.green_lower = np.array([30, 30, 30])
         self.green_upper = np.array([85, 255, 255])
         self.min_circle_radius = 10
@@ -110,23 +111,33 @@ class ManualGalvoCalibrationNode:
 
         # 键盘绑定
         self.key_handlers = {
+            # 移动控制
             'w': self.move_up,
             's': self.move_down,
             'a': self.move_left,
             'd': self.move_right,
+
+            # 步进与模式控制
             'q': self.increase_step,
             'e': self.decrease_step,
             'f': self.toggle_fine_mode,
+
+            # 激光与标定流程控制
             'l': self.toggle_laser,
             'r': self.record_calibration_point,
             'n': self.next_target,
             'p': self.previous_target,
             'c': self.save_calibration,
-            'x': self.reset_calibration,
             ' ': self.center_to_auto_position,
+
+            # === 新增的全局控制 ===
+            'b': self.start_calibration,  # <--- 新增：开始标定
+            'i': self.init_galvo_center,  # <--- 新增：回到图像中心
+            'k': self.stop_calibration,  # <--- 新增：停止标定
+            'x': self.reset_calibration,  # (已有) 重置标定
+
+            # 其他功能键
             'h': self.move_to_home,
-            # 'i': self.init_galvo_center,
-            # 't': self.test_coordinate_mapping,
             'o': self.test_four_corners,
         }
 
@@ -165,28 +176,6 @@ class ManualGalvoCalibrationNode:
         else:
             rospy.loginfo("Depth disabled by parameter ~use_depth=false")
 
-    # ===================== 轴适配：逻辑 <-> 硬件 =====================
-    def _to_hw_axes(self, x, y):
-        lx, ly = int(x), int(y)
-        # if self.swap_axes:
-        #     lx, ly = ly, lx
-        # if self.invert_x:
-        #     lx = -lx
-        # if self.invert_y:
-        #     ly = -ly
-        return lx, ly
-
-    def _from_hw_axes(self, x, y):
-        hx, hy = int(x), int(y)
-        # if self.invert_x:
-        #     hx = -hx
-        # if self.invert_y:
-        #     hy = -hy
-        # if self.swap_axes:
-        #     hx, hy = hy, hx
-        return hx, hy
-
-    # ===================== ROS 基础 =====================
     def signal_handler(self, signum, frame):
         rospy.loginfo("Received shutdown signal, cleaning up...")
         self.cleanup()
@@ -217,7 +206,7 @@ class ManualGalvoCalibrationNode:
     def setup_ros_interface(self):
         # image_topic = rospy.get_param('~image_topic', '/camera/color/image_raw')
         self.image_sub = rospy.Subscriber( '/camera/color/image_raw', Image, self.image_callback, queue_size=1)
-        self.command_sub = rospy.Subscriber('/manual_calibration_command', String, self.command_callback, queue_size=1)
+        # self.command_sub = rospy.Subscriber('/manual_calibration_command', String, self.command_callback, queue_size=1)
 
         self.status_pub = rospy.Publisher('/manual_calibration_status', String, queue_size=1)
         self.result_img_pub = rospy.Publisher('/manual_calibration_image', Image, queue_size=1)
@@ -225,59 +214,6 @@ class ManualGalvoCalibrationNode:
         self.laser_pub = rospy.Publisher('/laser_control', Bool, queue_size=1)
 
         self.status_timer = rospy.Timer(rospy.Duration(0.5), self.publish_status)
-
-    # ===================== 初始化与测试 =====================
-    def auto_init_galvo_center(self, event):
-        rospy.loginfo("Auto-initializing galvo to image center...")
-        self.init_galvo_center()
-
-    def init_galvo_center(self):
-        self.calibration_state = "CENTERING"
-        self.image_center_galvo_pos = [0, 0]
-        with self.position_lock:
-            self.target_galvo_pos = [0, 0]
-            self.manual_galvo_pos = [0, 0]
-        rospy.Timer(rospy.Duration(1.0), lambda e: setattr(self, 'calibration_state', 'IDLE'), oneshot=True)
-
-    # def test_coordinate_mapping(self):
-    #     rospy.loginfo("Testing coordinate mapping...")
-    #     u = int(self.image_width // 2)
-    #     v = int(self.image_height // 2)
-    #
-    #     code_hw = self.coordinate_transform.pixel_to_galvo_code(u, v, self.image_width, self.image_height)
-    #     rospy.loginfo(f"Image center ({u}, {v}) -> Galvo(HW) {code_hw}")
-    #
-    #     if code_hw:
-    #         uv2 = self.coordinate_transform.galvo_code_to_pixel_3d(int(code_hw[0]), int(code_hw[1]),
-    #                                                             self.image_width, self.image_height)
-    #         if uv2:
-    #             du, dv = uv2[0] - u, uv2[1] - v
-    #             rospy.loginfo(f"Roundtrip error: ({du:.2f}, {dv:.2f}) px")
-    #
-    #         # 把硬件码值转回逻辑坐标存入目标位置
-    #         lx, ly = self._from_hw_axes(int(code_hw[0]), int(code_hw[1]))
-    #         galvo_pos_logical = self.clamp_galvo_position(lx, ly)
-    #         with self.position_lock:
-    #             self.target_galvo_pos = galvo_pos_logical
-    #             self.manual_galvo_pos = galvo_pos_logical
-
-    def test_four_corners(self):
-        rospy.loginfo("Testing four corners mapping...")
-        corners = [
-            (50, 50, "Top-Left"),
-            (self.image_width - 50, 50, "Top-Right"),
-            (self.image_width - 50, self.image_height - 50, "Bottom-Right"),
-            (50, self.image_height - 50, "Bottom-Left"),
-        ]
-        for px, py, label in corners:
-            code_hw = self.coordinate_transform.pixel_to_galvo_code(px, py, self.image_width, self.image_height)
-            rospy.loginfo(f"{label}: Pixel({px}, {py}) -> Galvo(HW){code_hw}")
-
-    # ===================== 基础工具 =====================
-    def clamp_galvo_position(self, x, y):
-        x = max(self.galvo_min, min(self.galvo_max, int(x)))
-        y = max(self.galvo_min, min(self.galvo_max, int(y)))
-        return [x, y]
 
     # ===================== 回调 =====================
     def image_callback(self, msg):
@@ -321,6 +257,93 @@ class ManualGalvoCalibrationNode:
 
         except Exception as e:
             rospy.logwarn_throttle(5.0, f"[depth] failed to convert: {e}")
+
+    # ===================== 控制环 =====================
+    def galvo_control_loop(self):
+        rate = rospy.Rate(200)  # 200Hz
+        while self.running and not rospy.is_shutdown():
+            try:
+                with self.position_lock:
+                    target_pos_logical = self.target_galvo_pos.copy()
+
+                target_pos_logical = self.clamp_galvo_position(target_pos_logical[0], target_pos_logical[1])
+
+                # 发送到硬件前：逻辑 -> 硬件
+                hx, hy = self._to_hw_axes(target_pos_logical[0], target_pos_logical[1])
+
+                if self.galvo_controller:
+                    self.galvo_controller.move_to_position(hx, hy)
+
+                self.current_galvo_pos = target_pos_logical  # 记录当前“逻辑”位置
+
+                galvo_msg = Int32MultiArray()
+                galvo_msg.data = [int(target_pos_logical[0]), int(target_pos_logical[1]), 1 if self.laser_on else 0]
+                self.galvo_pub.publish(galvo_msg)
+
+                rate.sleep()
+            except Exception as e:
+                rospy.logerr(f"Galvo control error: {e}")
+                time.sleep(0.01)
+
+    def set_laser(self, enable):
+        if self.laser_on != enable:
+            self.laser_on = enable
+            laser_msg = Bool()
+            laser_msg.data = enable
+            self.laser_pub.publish(laser_msg)
+            if self.galvo_controller:
+                try:
+                    self.galvo_controller.send_command("LASER:ON" if enable else "LASER:OFF")
+                except Exception as e:
+                    rospy.logerr(f"Failed to control laser: {e}")
+            rospy.loginfo(f"Laser: {'ON' if enable else 'OFF'}")
+
+    # ===================== 命令流 =====================
+    # def command_callback(self, msg):
+    #     command = msg.data.strip().lower()
+    #     rospy.loginfo(f"Received command: {command}")
+    #     if command == 'start':
+    #         self.start_calibration()
+    #     elif command == 'center':
+    #         self.init_galvo_center()
+    #     elif command == 'stop':
+    #         self.stop_calibration()
+    #     elif command == 'reset':
+    #         self.reset_calibration()
+    #     else:
+    #         rospy.logwarn(f"Unknown command: {command}")
+
+    # ===================== 初始化与测试 =====================
+    def auto_init_galvo_center(self, event):
+        rospy.loginfo("Auto-initializing galvo to image center...")
+        self.init_galvo_center()
+
+    def init_galvo_center(self):
+        self.calibration_state = "CENTERING"
+        self.image_center_galvo_pos = [0, 0]
+        with self.position_lock:
+            self.target_galvo_pos = [0, 0]
+            self.manual_galvo_pos = [0, 0]
+        rospy.Timer(rospy.Duration(1.0), lambda e: setattr(self, 'calibration_state', 'IDLE'), oneshot=True)
+
+    def test_four_corners(self):
+        rospy.loginfo("Testing four corners mapping...")
+        corners = [
+            (50, 50, "Top-Left"),
+            (self.image_width - 50, 50, "Top-Right"),
+            (self.image_width - 50, self.image_height - 50, "Bottom-Right"),
+            (50, self.image_height - 50, "Bottom-Left"),
+        ]
+        for px, py, label in corners:
+            code_hw = self.coordinate_transform.pixel_to_galvo_code(px, py, self.image_width, self.image_height)
+            rospy.loginfo(f"{label}: Pixel({px}, {py}) -> Galvo(HW){code_hw}")
+
+    # ===================== 基础工具 =====================
+    def clamp_galvo_position(self, x, y):
+        x = max(self.galvo_min, min(self.galvo_max, int(x)))
+        y = max(self.galvo_min, min(self.galvo_max, int(y)))
+        return [x, y]
+
 
     def depth_query_func(self, u, v):
         """查询像素(u,v)深度（米）"""
@@ -487,20 +510,7 @@ class ManualGalvoCalibrationNode:
         # （可选）深度一致性：若开启 use_depth，可在此对 stable 逐个圆做邻域深度方差过滤
         # 例：方差 > 0.05m^2 或 无效深度比例过高则剔除
 
-    # ===================== 命令流 =====================
-    def command_callback(self, msg):
-        command = msg.data.strip().lower()
-        rospy.loginfo(f"Received command: {command}")
-        if command == 'start':
-            self.start_calibration()
-        elif command == 'center':
-            self.init_galvo_center()
-        elif command == 'stop':
-            self.stop_calibration()
-        elif command == 'reset':
-            self.reset_calibration()
-        else:
-            rospy.logwarn(f"Unknown command: {command}")
+
 
     def start_calibration(self):
         if len(self.detected_circles) < 2:
@@ -589,10 +599,12 @@ class ManualGalvoCalibrationNode:
 
     def print_help(self):
         rospy.loginfo("=== KEYBOARD HELP ===")
-        rospy.loginfo("WASD: Move galvo | L: Laser | R: Record | SPACE: Auto pos")
-        rospy.loginfo("QE: Step size | F: Fine mode | NP: Next/Prev target")
-        rospy.loginfo("C: Save | X: Reset | H: Home | I: Init center")
-        rospy.loginfo("T: Test mapping | O: Corners | Ctrl+C: Exit")
+        rospy.loginfo("WASD: 移动 | L: 激光 | R: 记录点 | SPACE: 自动对准")
+        rospy.loginfo(" NP : 上/下一个目标 | C: 计算并保存 | H: 回原点(0,0)")
+        rospy.loginfo(" QE : 增/减步长 | F: 精细模式切换 | O: 测试四角")
+        rospy.loginfo("-------------------------------------------------")
+        rospy.loginfo(" B  : 开始标定流程 | K: 停止流程 | X: 重置数据 | I: 初始化中心")
+        rospy.loginfo(" Ctrl+C: 退出程序")
 
     # 原始 WASD（逻辑坐标）
     def move_up(self):
@@ -675,116 +687,163 @@ class ManualGalvoCalibrationNode:
         self.set_laser(not self.laser_on)
 
     def record_calibration_point(self):
+        """
+        记录一个标定数据点。
+        获取当前目标的像素位置、深度，以及手动微调后的振镜码值，
+        并将这些原始数据保存到 self.calibration_data 列表中，以备后续进行三维计算。
+        """
         if self.calibration_state != "MANUAL_AIMING" or not self.current_target:
-            rospy.logwarn("No current target to record")
+            rospy.logwarn("不在手动瞄准模式，或没有当前目标，无法记录。\n")
             return
 
+        # 1. 获取目标的像素坐标 (u, v)
         pixel_x, pixel_y = self.current_target['center']
-        manual_galvo_x, manual_galvo_y = self.manual_galvo_pos  # 逻辑
 
-        center_x = self.image_width / 2.0
-        center_y = self.image_height / 2.0
-        pixel_offset_x = pixel_x - center_x
-        pixel_offset_y = center_y - pixel_y
+        # 2. 查询并验证该像素点的深度值 (z)
+        depth_z = self.depth_query_func(pixel_x, pixel_y)
+        if depth_z is None or depth_z <= 0:  # 深度值必须是有效的正数
+            rospy.logwarn(f"无法在目标点 ({pixel_x}, {pixel_y}) 获取有效深度，该点已跳过。\n")
+            return
 
-        # 几何映射得到code
-        code_hw = self.coordinate_transform.pixel_to_galvo_code(
-            pixel_x, pixel_y, self.image_width, self.image_height
-        )
-        if code_hw:
-            th_lx, th_ly = self._from_hw_axes(int(code_hw[0]), int(code_hw[1]))  # 理论“逻辑”码值
-        else:
-            th_lx, th_ly = 0, 0
+        # 3. 获取手动校准后的振镜逻辑码值 (gx, gy)
+        manual_galvo_x, manual_galvo_y = self.manual_galvo_pos
 
-        # 码值偏移
-        galvo_offset_x = manual_galvo_x - th_lx
-        galvo_offset_y = manual_galvo_y - th_ly
-
-        # 偏移角度
-        angle_offset_x, angle_offset_y = self.galvo_offset_to_angle_offset(galvo_offset_x, galvo_offset_y)
-
+        # 4. 将所有必需的原始数据打包成一个字典
         calibration_point = {
             'target_index': self.current_target_index,
             'pixel_position': [int(pixel_x), int(pixel_y)],
-            'pixel_offset_from_center': [float(pixel_offset_x), float(pixel_offset_y)],
-            'theoretical_galvo_position_logical': [int(th_lx), int(th_ly)],
+            'depth_meters': float(depth_z),
             'manual_galvo_position_logical': [int(manual_galvo_x), int(manual_galvo_y)],
-            'galvo_offset_logical': [int(galvo_offset_x), int(galvo_offset_y)],
-            'angle_offset_deg': [float(angle_offset_x), float(angle_offset_y)],
             'timestamp': time.time()
         }
 
+        # 5. 将数据点添加到列表中
         self.calibration_data.append(calibration_point)
+        rospy.loginfo(f"成功记录第 {self.current_target_index + 1} 个标定点。\n")
 
+        # 6. 自动前进到下一个目标点
         self.current_target_index += 1
-        rospy.Timer(rospy.Duration(1.0), lambda e: self.next_target(), oneshot=True)
-
-    def galvo_offset_to_angle_offset(self, galvo_offset_x, galvo_offset_y):
-        try:
-            galvo_params = self.coordinate_transform.params['galvo_params']
-            scan_angle = galvo_params['scan_angle']
-            max_code = galvo_params['max_code']
-            half_scan_angle = scan_angle / 2.0
-            angle_offset_x = (float(galvo_offset_x) / float(max_code)) * half_scan_angle
-            angle_offset_y = (float(galvo_offset_y) / float(max_code)) * half_scan_angle
-            return angle_offset_x, angle_offset_y
-        except Exception as e:
-            rospy.logerr(f"Failed to convert galvo offset to angle offset: {e}")
-            return 0.0, 0.0
+        rospy.Timer(rospy.Duration(0.5), lambda e: self.next_target(), oneshot=True)
 
     def save_calibration(self):
-        if len(self.calibration_data) < 2:
-            rospy.logwarn("Need at least 2 calibration points to save")
+        """
+        计算并保存最终的三维标定结果（外参）。
+        """
+        if len(self.calibration_data) < 3:
+            rospy.logwarn(f"三维标定至少需要3个标定点，当前只有 {len(self.calibration_data)} 个。\n")
             return
 
-        angle_offsets = np.array([cp['angle_offset_deg'] for cp in self.calibration_data], dtype=np.float64)
-        bias_x = float(np.mean(angle_offsets[:, 0]))
-        bias_y = float(np.mean(angle_offsets[:, 1]))
-        std_x = float(np.std(angle_offsets[:, 0]))
-        std_y = float(np.std(angle_offsets[:, 1]))
-        max_error_x = float(np.max(np.abs(angle_offsets[:, 0])))
-        max_error_y = float(np.max(np.abs(angle_offsets[:, 1])))
+        rospy.loginfo("开始计算三维刚体变换...\n")
+
+        points_camera = []
+        points_galvo = []
+        # 遍历所有记录的数据点    1.从像素坐标到振镜坐标(程序识别的)     2.手动控制的galvo code到振镜坐标
+        #3. 找出两个振镜坐标之间的变换关系
+        for point in self.calibration_data:
+            u, v = point['pixel_position']
+            z = point['depth_meters']
+            gx, gy = point['manual_galvo_position_logical']
+
+            p_cam = self.coordinate_transform.pixel_depth_to_point_galvo(u, v, z)    #from pixel to galvo
+            z = float(p_cam[2]/1000)
+            print("p_cam", p_cam)
+            p_galvo = self._manual_code_to_galvo_frame_mm(gx, gy, z)
+            print("p_galvo", p_galvo)
+            if p_cam is not None and p_galvo is not None:
+                points_camera.append(p_cam)
+                points_galvo.append(p_galvo)
+            else:
+                rospy.logwarn(f"跳过标定点 {point['target_index']}，因为坐标转换失败。\n")
+
+        if len(points_camera) < 3:
+            rospy.logerr(f"有效标定点不足3个({len(points_camera)}个)，无法进行三维标定。\n")
+            return
+
+        points_camera_np = np.array(points_camera, dtype=np.float64)
+        points_galvo_np = np.array(points_galvo, dtype=np.float64)
+
+        # (调试可选) 保存点云到文件进行可视化检查
+        # np.savetxt("points_camera.txt", points_camera_np, fmt='%.4f')
+        # np.savetxt("points_galvo.txt", points_galvo_np, fmt='%.4f')
+
+        try:
+            R, t = self.find_rigid_transform_3d(points_camera_np, points_galvo_np)
+            rospy.loginfo("三维变换计算成功。\n")
+            rospy.loginfo(f"新的旋转矩阵 R (相机->振镜):\n{np.round(R, 4)}\n")
+            rospy.loginfo(f"新的平移向量 t (相机->振镜) [mm]:\n{np.round(t, 4)}\n")
+        except Exception as e:
+            rospy.logerr(f"计算三维变换时发生错误: {e}\n")
+            return
 
         calibration_result = {
             'calibration_info': {
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'num_points': len(self.calibration_data),
-                'image_size': [int(self.image_width), int(self.image_height)],
-                'method': 'manual_adjustment_with_geometric_mapping',
-                'image_center_galvo_pos_logical': [int(self.image_center_galvo_pos[0]), int(self.image_center_galvo_pos[1])],
-                'axis_adaptation': {
-                    # 'swap_axes': bool(self.swap_axes),
-                    # 'invert_x': bool(self.invert_x),
-                    # 'invert_y': bool(self.invert_y),
-                }
+                'num_points_used': len(points_camera),
+                'method': '3D_rigid_body_transform_SVD'
             },
-            'calibration_points': self.calibration_data,
-            'angle_bias': {
-                'bias_x': bias_x,
-                'bias_y': bias_y,
-                'std_x': std_x,
-                'std_y': std_y,
-                'max_error_x': max_error_x,
-                'max_error_y': max_error_y,
-                'rms_error': float(np.sqrt(np.mean(np.sum(angle_offsets ** 2, axis=1))))
-            },
-            'updated_galvo_params': {
-                'scan_angle': float(self.coordinate_transform.params['galvo_params']['scan_angle']),
-                'scale_x': float(self.coordinate_transform.params['galvo_params']['scale_x']),
-                'scale_y': float(self.coordinate_transform.params['galvo_params']['scale_y']),
-                'bias_x': bias_x,
-                'bias_y': bias_y,
-                'max_code': int(self.coordinate_transform.params['galvo_params']['max_code'])
+            'extrinsics': {
+                'description': '新的相机外参: 从相机坐标系到振镜坐标系的变换 (Pg = R * Pc + t)',
+                't_gc_mm': t.flatten().tolist(),
+                'R_gc': R.tolist(),
+                'q_gc_xyzw': Rotation.from_matrix(R).as_quat().tolist()
             }
         }
 
         try:
             with open(self.calibration_result_file, 'w') as f:
-                yaml.dump(calibration_result, f, default_flow_style=False)
-            rospy.loginfo(f"Manual calibration saved to: {self.calibration_result_file}")
-            self.generate_updated_config(calibration_result)
+                yaml.dump(calibration_result, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+            rospy.loginfo(f"新的三维标定结果已成功保存至: {self.calibration_result_file}\n")
         except Exception as e:
-            rospy.logerr(f"Failed to save calibration: {e}")
+            rospy.logerr(f"保存标定文件失败: {e}\n")
+
+    def _unproject_to_camera_frame_mm(self, u, v, z_m):
+        """辅助方法：将像素和深度（米）反投影为相机坐标系下的三维点（毫米）。"""
+        try:
+            K = self.coordinate_transform.K
+            x_c = (u - K[0, 2]) / K[0, 0]* z_m
+            y_c = (v - K[1, 2]) / K[1, 1]* z_m
+            z_c = z_m
+            return np.array([x_c * 1000.0, y_c * 1000.0, z_c * 1000.0])
+        except Exception as e:
+            rospy.logwarn(f"反投影计算失败: {e}\n")
+            return None
+
+    def _manual_code_to_galvo_frame_mm(self, gx, gy, z_m):
+        """辅助方法：将振镜码值和深度（米）转换为振镜坐标系下的三维点（毫米）。"""
+        try:
+            theta_x, theta_y = self.coordinate_transform.codes_to_angles(gx, gy)
+            # print("theta_x, theta_y ",theta_x, theta_y)
+            z_mm = z_m * 1000.0
+            point_g = self.coordinate_transform.galvo_angles_to_point_depth_cam(theta_x, theta_y, z_mm)
+            # print("point g,",point_g)
+            return point_g
+        except Exception as e:
+            rospy.logwarn(f"从振镜码值计算三维点失败: {e}\n")
+            return None
+
+    def find_rigid_transform_3d(self, points_A, points_B):
+        """使用SVD算法计算从点云A到点云B的三维刚体变换（旋转R和平移t）。"""
+        if points_A.shape != points_B.shape:
+            raise ValueError("输入点云的维度必须相同\n")
+        if points_A.shape[0] < 3:
+            raise ValueError("至少需要3个点来计算变换\n")
+
+        centroid_A = np.mean(points_A, axis=0)
+        centroid_B = np.mean(points_B, axis=0)
+        A_centered = points_A - centroid_A
+        B_centered = points_B - centroid_B
+        H = A_centered.T @ B_centered
+        U, S, Vt = np.linalg.svd(H)
+        V = Vt.T
+        R = V @ U.T
+
+        if np.linalg.det(R) < 0:
+            rospy.logdebug("检测到反射，正在进行修正...\n")
+            V[:, -1] *= -1
+            R = V @ U.T
+
+        t = centroid_B.T - R @ centroid_A.T
+        return R, t.reshape(3, 1)
 
     def generate_updated_config(self, calibration_result):
         try:
@@ -813,45 +872,27 @@ class ManualGalvoCalibrationNode:
         self.set_laser(False)
         rospy.loginfo("Manual calibration stopped")
 
-    # ===================== 控制环（逻辑 -> 硬件 -> Teensy） =====================
-    def galvo_control_loop(self):
-        rate = rospy.Rate(200)  # 200Hz
-        while self.running and not rospy.is_shutdown():
-            try:
-                with self.position_lock:
-                    target_pos_logical = self.target_galvo_pos.copy()
 
-                target_pos_logical = self.clamp_galvo_position(target_pos_logical[0], target_pos_logical[1])
+    # ===================== 轴适配=====================
+    def _to_hw_axes(self, x, y):
+        lx, ly = int(x), int(y)
+        # if self.swap_axes:
+        #     lx, ly = ly, lx
+        # if self.invert_x:
+        #     lx = -lx
+        # if self.invert_y:
+        #     ly = -ly
+        return lx, ly
 
-                # 发送到硬件前：逻辑 -> 硬件
-                hx, hy = self._to_hw_axes(target_pos_logical[0], target_pos_logical[1])
-
-                if self.galvo_controller:
-                    self.galvo_controller.move_to_position(hx, hy)
-
-                self.current_galvo_pos = target_pos_logical  # 记录当前“逻辑”位置
-
-                galvo_msg = Int32MultiArray()
-                galvo_msg.data = [int(target_pos_logical[0]), int(target_pos_logical[1]), 1 if self.laser_on else 0]
-                self.galvo_pub.publish(galvo_msg)
-
-                rate.sleep()
-            except Exception as e:
-                rospy.logerr(f"Galvo control error: {e}")
-                time.sleep(0.01)
-
-    def set_laser(self, enable):
-        if self.laser_on != enable:
-            self.laser_on = enable
-            laser_msg = Bool()
-            laser_msg.data = enable
-            self.laser_pub.publish(laser_msg)
-            if self.galvo_controller:
-                try:
-                    self.galvo_controller.send_command("LASER:ON" if enable else "LASER:OFF")
-                except Exception as e:
-                    rospy.logerr(f"Failed to control laser: {e}")
-            rospy.loginfo(f"Laser: {'ON' if enable else 'OFF'}")
+    def _from_hw_axes(self, x, y):
+        hx, hy = int(x), int(y)
+        # if self.invert_x:
+        #     hx = -hx
+        # if self.invert_y:
+        #     hy = -hy
+        # if self.swap_axes:
+        #     hx, hy = hy, hx
+        return hx, hy
 
     # ===================== 叠加显示（几何一律用“硬件”码值） =====================
     def draw_calibration_info(self, image):
