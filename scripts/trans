@@ -1,0 +1,146 @@
+def detect_circles(self, image):
+    import cv2
+    import numpy as np
+
+    # 转为灰度图
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+
+    # ---------- 方法1: 标准霍夫圆检测 ----------
+    # 高斯模糊减少噪声
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+    
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1,                    # 累加器分辨率与图像分辨率的反比
+        minDist=30,              # 圆心之间最小距离
+        param1=50,               # Canny边缘检测高阈值
+        param2=30,               # 累加器阈值，越小检测到越多圆
+        minRadius=5,             # 最小半径
+        maxRadius=0              # 最大半径，0表示不限制
+    )
+    
+    result_circles = []
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype("int")
+        for (x, y, r) in circles:
+            result_circles.append({
+                'center': (x, y),
+                'radius': r,
+                'area': np.pi * r * r
+            })
+    
+    # ---------- 方法2: 多尺度霍夫检测（如果方法1效果不好） ----------
+    if len(result_circles) == 0:
+        # 尝试不同的参数组合
+        param_sets = [
+            {'param1': 100, 'param2': 20, 'minDist': 20},
+            {'param1': 80, 'param2': 40, 'minDist': 25},
+            {'param1': 60, 'param2': 50, 'minDist': 15},
+        ]
+        
+        for params in param_sets:
+            circles = cv2.HoughCircles(
+                blurred,
+                cv2.HOUGH_GRADIENT,
+                dp=1,
+                minDist=params['minDist'],
+                param1=params['param1'],
+                param2=params['param2'],
+                minRadius=3,
+                maxRadius=0
+            )
+            
+            if circles is not None:
+                circles = np.round(circles[0, :]).astype("int")
+                for (x, y, r) in circles:
+                    result_circles.append({
+                        'center': (x, y),
+                        'radius': r,
+                        'area': np.pi * r * r
+                    })
+                break
+    
+    # ---------- 方法3: 边缘+轮廓检测（备选方案） ----------
+    if len(result_circles) == 0:
+        # Canny边缘检测
+        edges = cv2.Canny(blurred, 50, 150)
+        
+        # 形态学操作连接断开的边缘
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+        
+        # 轮廓检测
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 50:  # 最小面积过滤
+                continue
+            
+            # 轮廓近似
+            epsilon = 0.02 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, epsilon, True)
+            
+            # 计算最小外接圆
+            (x, y), radius = cv2.minEnclosingCircle(cnt)
+            
+            # 简单的圆形判断
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter > 0:
+                circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+                if circularity > 0.4 and radius > 3:  # 非常宽松的条件
+                    result_circles.append({
+                        'center': (int(x), int(y)),
+                        'radius': int(radius),
+                        'area': area
+                    })
+    
+    # 去重和排序
+    if result_circles:
+        # 简单去重：如果两个圆心距离很近且半径相似，保留面积大的
+        filtered = []
+        result_circles.sort(key=lambda x: x['area'], reverse=True)
+        
+        for circle in result_circles:
+            is_duplicate = False
+            for existing in filtered:
+                dist = np.hypot(circle['center'][0] - existing['center'][0], 
+                               circle['center'][1] - existing['center'][1])
+                radius_diff = abs(circle['radius'] - existing['radius'])
+                
+                if dist < 20 and radius_diff < 10:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                filtered.append(circle)
+        
+        result_circles = filtered[:20]  # 最多返回20个圆
+    
+    self.detected_circles = result_circles
+    return result_circles
+
+
+# 如果需要可视化检测结果
+def visualize_circles(self, image, circles):
+    import cv2
+    
+    result_img = image.copy()
+    for circle in circles:
+        center = circle['center']
+        radius = circle['radius']
+        
+        # 画圆
+        cv2.circle(result_img, center, radius, (0, 255, 0), 2)
+        # 画圆心
+        cv2.circle(result_img, center, 2, (0, 0, 255), 3)
+        # 标注半径
+        cv2.putText(result_img, f"r:{radius}", 
+                   (center[0] + radius + 5, center[1]), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+    
+    return result_img
