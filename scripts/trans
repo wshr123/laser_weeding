@@ -1,4 +1,4 @@
-def detect_circles(self, image):
+def detect_green_circles(self, image):
     import cv2
     import numpy as np
 
@@ -8,139 +8,137 @@ def detect_circles(self, image):
     else:
         gray = image.copy()
 
-    # ---------- 方法1: 标准霍夫圆检测 ----------
-    # 高斯模糊减少噪声
+    # ---------- 霍夫圆检测 ----------
     blurred = cv2.GaussianBlur(gray, (9, 9), 2)
     
     circles = cv2.HoughCircles(
         blurred,
         cv2.HOUGH_GRADIENT,
-        dp=1,                    # 累加器分辨率与图像分辨率的反比
-        minDist=30,              # 圆心之间最小距离
-        param1=50,               # Canny边缘检测高阈值
-        param2=30,               # 累加器阈值，越小检测到越多圆
-        minRadius=5,             # 最小半径
-        maxRadius=0              # 最大半径，0表示不限制
+        dp=1,
+        minDist=30,
+        param1=50,
+        param2=30,
+        minRadius=5,
+        maxRadius=0
     )
     
-    result_circles = []
+    # 当前帧检测到的圆
+    current_circles = []
     if circles is not None:
         circles = np.round(circles[0, :]).astype("int")
         for (x, y, r) in circles:
-            result_circles.append({
+            current_circles.append({
                 'center': (x, y),
                 'radius': r,
                 'area': np.pi * r * r
             })
+
+    # ---------- 初始化跟踪变量（保持在self中） ----------
+    if not hasattr(self, '_tracked_circles'):
+        self._tracked_circles = []
+    if not hasattr(self, '_next_circle_id'):
+        self._next_circle_id = 0
+    if not hasattr(self, '_frame_count'):
+        self._frame_count = 0
     
-    # ---------- 方法2: 多尺度霍夫检测（如果方法1效果不好） ----------
-    if len(result_circles) == 0:
-        # 尝试不同的参数组合
-        param_sets = [
-            {'param1': 100, 'param2': 20, 'minDist': 20},
-            {'param1': 80, 'param2': 40, 'minDist': 25},
-            {'param1': 60, 'param2': 50, 'minDist': 15},
-        ]
+    self._frame_count += 1
+
+    # ---------- 跟踪逻辑 ----------
+    max_distance = 50  # 最大跟踪距离
+    max_missing_frames = 5  # 最大丢失帧数
+    
+    # 为当前检测到的圆分配ID
+    updated_tracks = []
+    used_detections = set()
+    
+    # 1. 更新现有轨迹
+    for track in self._tracked_circles:
+        best_match = None
+        best_distance = max_distance
+        best_idx = -1
         
-        for params in param_sets:
-            circles = cv2.HoughCircles(
-                blurred,
-                cv2.HOUGH_GRADIENT,
-                dp=1,
-                minDist=params['minDist'],
-                param1=params['param1'],
-                param2=params['param2'],
-                minRadius=3,
-                maxRadius=0
+        # 寻找最近的检测结果
+        for i, detection in enumerate(current_circles):
+            if i in used_detections:
+                continue
+                
+            distance = np.hypot(
+                track['center'][0] - detection['center'][0],
+                track['center'][1] - detection['center'][1]
             )
             
-            if circles is not None:
-                circles = np.round(circles[0, :]).astype("int")
-                for (x, y, r) in circles:
-                    result_circles.append({
-                        'center': (x, y),
-                        'radius': r,
-                        'area': np.pi * r * r
-                    })
-                break
-    
-    # ---------- 方法3: 边缘+轮廓检测（备选方案） ----------
-    if len(result_circles) == 0:
-        # Canny边缘检测
-        edges = cv2.Canny(blurred, 50, 150)
+            # 同时考虑位置和半径的相似性
+            radius_diff = abs(track['radius'] - detection['radius'])
+            if distance < best_distance and radius_diff < track['radius'] * 0.5:
+                best_match = detection
+                best_distance = distance
+                best_idx = i
         
-        # 形态学操作连接断开的边缘
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-        
-        # 轮廓检测
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 50:  # 最小面积过滤
-                continue
+        if best_match is not None:
+            # 找到匹配，更新轨迹
+            used_detections.add(best_idx)
             
-            # 轮廓近似
-            epsilon = 0.02 * cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, epsilon, True)
+            # 平滑滤波更新位置和半径
+            alpha = 0.7  # 历史权重
+            new_x = int(alpha * track['center'][0] + (1-alpha) * best_match['center'][0])
+            new_y = int(alpha * track['center'][1] + (1-alpha) * best_match['center'][1])
+            new_r = int(alpha * track['radius'] + (1-alpha) * best_match['radius'])
             
-            # 计算最小外接圆
-            (x, y), radius = cv2.minEnclosingCircle(cnt)
-            
-            # 简单的圆形判断
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter > 0:
-                circularity = 4.0 * np.pi * area / (perimeter * perimeter)
-                if circularity > 0.4 and radius > 3:  # 非常宽松的条件
-                    result_circles.append({
-                        'center': (int(x), int(y)),
-                        'radius': int(radius),
-                        'area': area
-                    })
+            updated_tracks.append({
+                'id': track['id'],
+                'center': (new_x, new_y),
+                'radius': new_r,
+                'area': np.pi * new_r * new_r,
+                'missing_frames': 0,
+                'confidence': min(1.0, track['confidence'] + 0.2)
+            })
+        else:
+            # 没找到匹配，增加丢失帧数
+            track['missing_frames'] += 1
+            if track['missing_frames'] < max_missing_frames:
+                # 保持原位置，降低置信度
+                track['confidence'] = max(0.1, track['confidence'] - 0.3)
+                updated_tracks.append(track)
     
-    # 去重和排序
-    if result_circles:
-        # 简单去重：如果两个圆心距离很近且半径相似，保留面积大的
-        filtered = []
-        result_circles.sort(key=lambda x: x['area'], reverse=True)
-        
-        for circle in result_circles:
-            is_duplicate = False
-            for existing in filtered:
-                dist = np.hypot(circle['center'][0] - existing['center'][0], 
-                               circle['center'][1] - existing['center'][1])
-                radius_diff = abs(circle['radius'] - existing['radius'])
-                
-                if dist < 20 and radius_diff < 10:
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                filtered.append(circle)
-        
-        result_circles = filtered[:20]  # 最多返回20个圆
+    # 2. 为未匹配的检测创建新轨迹
+    for i, detection in enumerate(current_circles):
+        if i not in used_detections:
+            updated_tracks.append({
+                'id': self._next_circle_id,
+                'center': detection['center'],
+                'radius': detection['radius'],
+                'area': detection['area'],
+                'missing_frames': 0,
+                'confidence': 0.5  # 新轨迹初始置信度较低
+            })
+            self._next_circle_id += 1
     
-    self.detected_circles = result_circles
-    return result_circles
-
-
-# 如果需要可视化检测结果
-def visualize_circles(self, image, circles):
-    import cv2
+    # 3. 过滤低置信度和长时间丢失的轨迹
+    self._tracked_circles = [
+        track for track in updated_tracks 
+        if track['confidence'] > 0.1 and track['missing_frames'] < max_missing_frames
+    ]
     
-    result_img = image.copy()
-    for circle in circles:
-        center = circle['center']
-        radius = circle['radius']
-        
-        # 画圆
-        cv2.circle(result_img, center, radius, (0, 255, 0), 2)
-        # 画圆心
-        cv2.circle(result_img, center, 2, (0, 0, 255), 3)
-        # 标注半径
-        cv2.putText(result_img, f"r:{radius}", 
-                   (center[0] + radius + 5, center[1]), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+    # ---------- 输出稳定的检测结果（保持原有格式） ----------
+    # 只输出高置信度的轨迹，格式与原函数保持一致
+    stable_circles = []
+    for track in self._tracked_circles:
+        if track['confidence'] > 0.4:  # 只输出置信度较高的
+            stable_circles.append({
+                'id': track['id'],  # 保持ID用于跟踪
+                'center': track['center'],
+                'radius': track['radius'],
+                'area': track['area']
+            })
     
-    return result_img
+    # 按面积排序
+    stable_circles.sort(key=lambda x: x['area'], reverse=True)
+    
+    # 保持原有的输出变量名
+    self.detected_circles = stable_circles[:10]  # 最多返回10个
+    
+    # 如果需要兼容原有代码，可以去掉ID字段
+    # self.detected_circles = [
+    #     {'center': c['center'], 'radius': c['radius'], 'area': c['area']}
+    #     for c in stable_circles[:10]
+    # ]
