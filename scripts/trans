@@ -1,144 +1,149 @@
-    def detect_green_circles(self, image):
-        H, W = image.shape[:2]
+def detect_green_circles(self, image):
+    H, W = image.shape[:2]
 
-        # ---------- 1) 颜色预处理：HSV 双区间 + S/V 下限 ----------
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        # 绿色常见两段：低H段（~35-85）；不同相机可能偏移，留冗余
-        lower1 = np.array([0, 0, 0], dtype=np.uint8)  # H,S,V 最低值提高，避免灰/暗
-        upper1 = np.array([179, 255, 80], dtype=np.uint8)
+    # ---------- 1) 颜色预处理：HSV 双区间 + S/V 下限 ----------
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # 绿色常见两段：低H段（~35-85）；不同相机可能偏移，留冗余
+    lower1 = np.array([0, 0, 0], dtype=np.uint8)  # H,S,V 最低值提高，避免灰/暗
+    upper1 = np.array([179, 255, 80], dtype=np.uint8)
 
-        mask = cv2.inRange(hsv, lower1, upper1)
+    mask = cv2.inRange(hsv, lower1, upper1)
 
-        # ---------- 2) 形态学抑噪：先开再闭，核稍大 ----------
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # ---------- 2) 形态学抑噪：先开再闭，核稍大 ----------
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-        # ---------- 3) 连通域 + 形状过滤 ----------
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # ---------- 3) 连通域 + 形状过滤 ----------
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # 根据画面尺度自适应的面积极小值（防止远处微点）
-        min_area = max(200, int(0.00015 * W * H))  # 可调：0.0001~0.0003
-        # 半径门限（像素）
-        min_r = max(self.min_circle_radius, 12)  # 提高下限
-        max_r = self.max_circle_radius
+    # 根据画面尺度自适应的面积极小值（防止远处微点）
+    min_area = max(200, int(0.00015 * W * H))  # 可调：0.0001~0.0003
+    # 半径门限（像素）
+    min_r = max(self.min_circle_radius, 12)  # 提高下限
+    max_r = self.max_circle_radius
 
-        candidates = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
+    candidates = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+
+        # 周长与圆度：圆度 = 4πA / P^2，越接近1越圆
+        perim = cv2.arcLength(cnt, True)
+        if perim <= 1e-3:
+            continue
+        circularity = 4.0 * np.pi * area / (perim * perim)
+        if circularity < 0.6:  # 0.7~0.85 之间按实际调整；越高越严格
+            continue
+
+        # 最小外接圆
+        (x, y), radius = cv2.minEnclosingCircle(cnt)
+        if radius < min_r or radius > max_r:
+            continue
+
+        # 圆填充度（等价你原先的 area / (πr²)）
+        circle_area = np.pi * radius * radius
+        fill_ratio = float(area) / float(circle_area + 1e-6)
+        if fill_ratio < 0.65:  # 0.6->0.75，更严格，过滤半圆/镂空边缘
+            continue
+
+        # 椭圆拟合离心率（对近似圆，轴长相近）
+        if len(cnt) >= 5:
+            ellipse = cv2.fitEllipse(cnt)
+            (ex, ey), (MA, ma), angle = ellipse  # MA>=ma（OpenCV可能返回相反顺序，统一排序）
+            MA, ma = max(MA, ma), min(MA, ma)
+            ratio = ma / (MA + 1e-6)  # 越接近1越圆
+            if ratio < 0.75:  # 过滤细长形
                 continue
 
-            # 周长与圆度：圆度 = 4πA / P^2，越接近1越圆
-            perim = cv2.arcLength(cnt, True)
-            if perim <= 1e-3:
-                continue
-            circularity = 4.0 * np.pi * area / (perim * perim)
-            if circularity < 0.6:  # 0.7~0.85 之间按实际调整；越高越严格
-                continue
+        candidates.append({
+            'center': (int(round(x)), int(round(y))),
+            'radius': int(round(radius)),
+            'area': float(area),
+            'circularity': float(circularity),
+            'fill': float(fill_ratio)
+        })
 
-            # 最小外接圆
-            (x, y), radius = cv2.minEnclosingCircle(cnt)
-            if radius < min_r or radius > max_r:
-                continue
+    # ---------- 4) NMS：最小圆间距，抑制紧邻小圈 ----------
+    # 以"综合得分"排序：更大面积、更圆、填充度高优先
+    def score(c):
+        return 0.6 * c['area'] + 0.3 * c['circularity'] * 10000 + 0.1 * c['fill'] * 10000
 
-            # 圆填充度（等价你原先的 area / (πr²)）
-            circle_area = np.pi * radius * radius
-            fill_ratio = float(area) / float(circle_area + 1e-6)
-            if fill_ratio < 0.65:  # 0.6->0.75，更严格，过滤半圆/镂空边缘
-                continue
+    candidates.sort(key=score, reverse=True)
 
-            # 椭圆拟合离心率（对近似圆，轴长相近）
-            if len(cnt) >= 5:
-                ellipse = cv2.fitEllipse(cnt)
-                (ex, ey), (MA, ma), angle = ellipse  # MA>=ma（OpenCV可能返回相反顺序，统一排序）
-                MA, ma = max(MA, ma), min(MA, ma)
-                ratio = ma / (MA + 1e-6)  # 越接近1越圆
-                if ratio < 0.75:  # 过滤细长形
-                    continue
-
-            candidates.append({
-                'center': (int(round(x)), int(round(y))),
-                'radius': int(round(radius)),
-                'area': float(area),
-                'circularity': float(circularity),
-                'fill': float(fill_ratio)
-            })
-
-        # ---------- 4) NMS：最小圆间距，抑制紧邻小圈 ----------
-        # 以“综合得分”排序：更大面积、更圆、填充度高优先
-        def score(c):
-            return 0.6 * c['area'] + 0.3 * c['circularity'] * 10000 + 0.1 * c['fill'] * 10000
-
-        candidates.sort(key=score, reverse=True)
-
-        picked = []
-        min_sep = 5  # 最小圆心距离（像素），可调大一点：25~35
-        for c in candidates:
-            ok = True
-            for p in picked:
-                if (c['center'][0] - p['center'][0]) ** 2 + (c['center'][1] - p['center'][1]) ** 2 < (min_sep ** 2):
-                    ok = False
-                    break
-            if ok:
-                picked.append(c)
-            if len(picked) >= 32:
+    picked = []
+    min_sep = 5  # 最小圆心距离（像素），可调大一点：25~35
+    for c in candidates:
+        ok = True
+        for p in picked:
+            if (c['center'][0] - p['center'][0]) ** 2 + (c['center'][1] - p['center'][1]) ** 2 < (min_sep ** 2):
+                ok = False
                 break
+        if ok:
+            picked.append(c)
+        if len(picked) >= 32:
+            break
 
-        # ---------- 5) （可选）时间一致性：连续命中才输出 ----------
-        # 需要在 __init__ 里：self._stable_pool = {}, self._frame_index = 0
-        self._frame_index += 1
-        new_pool = {}
-        max_dist_track = 25  # 帧间匹配距离像素
-        min_hits_to_show = 2  # 连续命中次数阈值（2~3更稳）
-        # 先把上一帧的目标拿出来匹配
-        for c in picked:
-            best_id, best_d = None, max_dist_track
-            for tid, t in self._stable_pool.items():
-                d = np.hypot(c['center'][0] - t['center'][0], c['center'][1] - t['center'][1])
-                if d < best_d:
-                    best_id, best_d = tid, d
-            if best_id is None:
-                # 新建 ID
-                self._next_circle_id += 1
-                best_id = self._next_circle_id
-                hits = 1
-            else:
-                hits = self._stable_pool[best_id]['hits'] + 1
-
-            # 指数平滑位置（减少抖动）
-            if best_id in self._stable_pool:
-                px, py = self._stable_pool[best_id]['center']
-                nx = int(round(0.6 * px + 0.4 * c['center'][0]))
-                ny = int(round(0.6 * py + 0.4 * c['center'][1]))
-            else:
-                nx, ny = c['center']
-
-            new_pool[best_id] = {
-                'center': (nx, ny),
-                'radius': int(
-                    round(0.5 * self._stable_pool.get(best_id, {'radius': c['radius']})['radius'] + 0.5 * c['radius'])),
-                'area': c['area'],
-                'circularity': c['circularity'],
-                'fill': c['fill'],
-                'hits': hits,
-                'last_seen': self._frame_index
-            }
-
-        # 清理长时间看不见的
-        for tid, t in list(self._stable_pool.items()):
-            if tid not in new_pool and (self._frame_index - t['last_seen']) <= 2:
-                # 给 2 帧缓冲（短时丢失不立即删除）
-                new_pool[tid] = t
-
-        self._stable_pool = new_pool
-
-        # 只有 hits 达标的才输出为 detected_circles
-        stable = []
+    # ---------- 5) 基于位置的跟踪：连续命中才输出 ----------
+    self._frame_index += 1
+    new_pool = {}
+    max_dist_track = 25  # 帧间匹配距离像素
+    min_hits_to_show = 2  # 连续命中次数阈值（2~3更稳）
+    
+    # 为每个检测到的圆找最近的已跟踪目标
+    used_ids = set()
+    for c in picked:
+        best_id, best_d = None, max_dist_track
         for tid, t in self._stable_pool.items():
-            if t['hits'] >= min_hits_to_show:
-                stable.append({'id': tid, 'center': t['center'], 'radius': t['radius'], 'area': t['area']})
+            if tid in used_ids:  # 避免一个ID被多个检测匹配
+                continue
+            d = np.hypot(c['center'][0] - t['center'][0], c['center'][1] - t['center'][1])
+            if d < best_d:
+                best_id, best_d = tid, d
+        
+        if best_id is None:
+            # 新建 ID
+            self._next_circle_id += 1
+            best_id = self._next_circle_id
+            hits = 1
+        else:
+            hits = self._stable_pool[best_id]['hits'] + 1
+            used_ids.add(best_id)
 
-        # 排序并截断
-        # stable.sort(key=lambda x: x['area'], reverse=True)
-        self.detected_circles = stable[:56]
+        # 指数平滑位置（减少抖动）
+        if best_id in self._stable_pool:
+            px, py = self._stable_pool[best_id]['center']
+            nx = int(round(0.6 * px + 0.4 * c['center'][0]))
+            ny = int(round(0.6 * py + 0.4 * c['center'][1]))
+            prev_radius = self._stable_pool[best_id]['radius']
+        else:
+            nx, ny = c['center']
+            prev_radius = c['radius']
+
+        new_pool[best_id] = {
+            'center': (nx, ny),
+            'radius': int(round(0.5 * prev_radius + 0.5 * c['radius'])),
+            'area': c['area'],
+            'circularity': c['circularity'],
+            'fill': c['fill'],
+            'hits': hits,
+            'last_seen': self._frame_index
+        }
+
+    # 保留未匹配的已跟踪目标（给予缓冲时间）
+    for tid, t in self._stable_pool.items():
+        if tid not in new_pool and (self._frame_index - t['last_seen']) <= 2:
+            # 给 2 帧缓冲（短时丢失不立即删除）
+            new_pool[tid] = t
+
+    self._stable_pool = new_pool
+
+    # 只有 hits 达标的才输出为 detected_circles
+    stable = []
+    for tid, t in self._stable_pool.items():
+        if t['hits'] >= min_hits_to_show:
+            stable.append({'id': tid, 'center': t['center'], 'radius': t['radius'], 'area': t['area']})
+
+    # 排序并截断
+    self.detected_circles = stable[:56]
