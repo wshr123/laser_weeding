@@ -24,7 +24,7 @@ from coordinate_transform import CameraGalvoTransform
 
 class SystemState(Enum):
     """系统状态枚举"""
-    IDLE = "IDLE"  # 空闲，等待目标
+    IDLE = "IDLE"      # 空闲，等待目标
     TRACKING = "TRACKING"  # 跟踪目标
     FIRING = "FIRING"  # 激光照射中
 
@@ -75,6 +75,8 @@ class LaserWeedingNode:
             self.serial_port = rospy.get_param('~serial_port', '/dev/ttyACM0')
             self.serial_baudrate = rospy.get_param('~serial_baudrate', 115200)
             self.min_move_step = rospy.get_param('~min_move_step', 2)
+            self.galvo_min = -32767
+            self.galvo_max = 32767
 
             # 图像参数
             self.image_width = rospy.get_param('~image_width', 640)
@@ -119,7 +121,7 @@ class LaserWeedingNode:
 
             # 目标管理
             self.current_target = None
-            self.target_queue = []
+            self.target_queue = []            # 将按“距离中心”动态排序
             self.processed_targets = set()
             self.processing_target = None
             self.all_targets = {}
@@ -172,12 +174,28 @@ class LaserWeedingNode:
             )
 
             # 标定和控制相关订阅器
-            self.calibration_sub = rospy.Subscriber(
-                '/calibration_command',
-                String,
-                self.calibration_callback,
-                queue_size=1
+            # self.calibration_sub = rospy.Subscriber(
+            #     '/calibration_command',
+            #     String,
+            #     self.calibration_callback,
+            #     queue_size=1
+            # )
+
+            # 深度图订阅  注入 depth_query_func
+            self.depth_image = None
+            self.depth_image_encoding = None
+            self.depth_image_lock = threading.Lock()
+            depth_topic = rospy.get_param("~depth_topic", "/camera/aligned_depth_to_color/image_raw")
+            self.depth_sub = rospy.Subscriber(
+                depth_topic,
+                Image,
+                self.depth_image_callback,
+                queue_size=1,
+                buff_size=2 ** 24
             )
+            rospy.loginfo(f"subscribed to depth topic: {depth_topic}")
+            # 设置 query 函数给变换器
+            self.coordinate_transform.set_depth_query(self.depth_query_func)
 
             # ========== 启动控制线程 ==========
             self.galvo_thread = threading.Thread(target=self.galvo_control_loop)
@@ -186,13 +204,13 @@ class LaserWeedingNode:
 
             # 主控制定时器
             self.control_timer = rospy.Timer(
-                rospy.Duration(0.005),  # 100Hz
+                rospy.Duration(0.005),  # 200 Hz
                 self.control_loop
             )
 
             # 状态发布定时器
             self.status_timer = rospy.Timer(
-                rospy.Duration(0.5),  # 2Hz
+                rospy.Duration(0.5),  # 2 Hz
                 self.publish_status
             )
 
@@ -246,43 +264,61 @@ class LaserWeedingNode:
     def control_loop(self, event):
         try:
             current_time = time.time()
-
+            # self.update_position_history([640,360], current_time)  #for test
             if self.system_state == SystemState.IDLE:
-                if self.target_queue and not self.current_target:
-                    while self.target_queue:
-                        target_id = self.target_queue[0]
-                        if target_id in self.processed_targets:
-                            self.target_queue.pop(0)
-                            rospy.logwarn(f"completed {target_id} is del from queue")
-                        else:
-                            break
+                # 进入空闲状态时，重新挑选队列：只保留“在扫描范围内”的目标，并按“距离中心”排序
+                candidates = []
+                cx = self.image_width / 2.0
+                cy = self.image_height / 2.0
 
-                    if self.target_queue:
-                        target_id = self.target_queue.pop(0)
-                        if target_id in self.all_targets and target_id not in self.processed_targets:
-                            self.current_target = {
-                                'id': target_id,
-                                'start_time': current_time
-                            }
-                            self.processing_target = target_id
-                            self.position_history.clear()
+                for tid, info in self.all_targets.items():
+                    if tid in self.processed_targets:
+                        continue
+                    if 'center' not in info:
+                        continue
+                    # 目标超时丢弃
+                    timeout = self.target_timeout
+                    if current_time - info.get('last_seen', current_time) > timeout:
+                        continue
+                    # 必须稳定到一定帧数
+                    if info.get('stable_frames', 0) < self.min_stable_frames:
+                        continue
+                    # 在扫描范围内才作为候选
+                    if not self.in_galvo_scan_range(info['center'][0], info['center'][1]):
+                        continue
 
-                            if self.use_kalman and self.kalman_filter:
-                                center = self.all_targets[target_id]['center']
-                                self.kalman_filter.statePre = np.array(
-                                    [[center[0]], [center[1]], [0], [0]],
-                                    dtype=np.float32
-                                )       #初始化kalman filter的状态向量为center，速度为0
+                    dist = np.hypot(info['center'][0] - cx, info['center'][1] - cy)
+                    candidates.append((dist, tid))
 
-                            self.change_state(SystemState.TRACKING)
-                            # rospy.loginfo(f"start tracking target {target_id}")
+                # 中心优先：按距离从近到远排序
+                candidates.sort(key=lambda x: x[0])
+                self.target_queue = [tid for _, tid in candidates]
+
+                # 取最近的一个作为当前处理对象
+                if self.target_queue:
+                    target_id = self.target_queue.pop(0)
+                    if target_id in self.all_targets and target_id not in self.processed_targets:
+                        self.current_target = {
+                            'id': target_id,
+                            'start_time': current_time
+                        }
+                        self.processing_target = target_id
+                        self.position_history.clear()
+
+                        if self.use_kalman and self.kalman_filter:
+                            center = self.all_targets[target_id]['center']
+                            self.kalman_filter.statePre = np.array(
+                                [[center[0]], [center[1]], [0], [0]],
+                                dtype=np.float32
+                            )
+
+                        self.change_state(SystemState.TRACKING)
 
             elif self.system_state == SystemState.TRACKING:
                 if self.current_target:
                     target_id = self.current_target['id']
 
                     if target_id in self.processed_targets:
-                        rospy.logwarn(f"target  {target_id} has been processed，skip")
                         self.current_target = None
                         self.processing_target = None
                         self.change_state(SystemState.IDLE)
@@ -295,9 +331,7 @@ class LaserWeedingNode:
                         elapsed = current_time - self.current_target['start_time']
                         if elapsed >= self.aiming_time:
                             self.change_state(SystemState.FIRING)
-                            # rospy.loginfo(f"start laser target {target_id}")
                     else:
-                        rospy.logwarn(f"tracking {target_id} lost")
                         self.current_target = None
                         self.processing_target = None
                         self.change_state(SystemState.IDLE)
@@ -313,12 +347,8 @@ class LaserWeedingNode:
                     elapsed = current_time - self.state_start_time
                     if elapsed >= self.laser_time:
                         self.processed_targets.add(target_id)
-
                         if target_id in self.all_targets:
                             self.all_targets[target_id]['processed'] = True
-
-                        rospy.loginfo(f"target {target_id} complete")
-                        # rospy.loginfo(f"total process target num: {len(self.processed_targets)}")
 
                         self.current_target = None
                         self.processing_target = None
@@ -327,29 +357,50 @@ class LaserWeedingNode:
         except Exception as e:
             rospy.logerr(f"control loop failed: {e}")
 
-
-    def calibration_callback(self, msg):
-        """标定命令回调"""
+    def depth_image_callback(self, msg):
+        """深度图回调：自动缓存为 numpy 格式 米"""
         try:
-            command_data = json.loads(msg.data)
-            command = command_data.get('command', '')
+            depth_cv = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            if msg.encoding == '16UC1':
+                depth_m = depth_cv.astype(np.float32) / 1000.0
+            elif msg.encoding == '32FC1':
+                depth_m = depth_cv.astype(np.float32)
+            else:
+                rospy.logwarn_throttle(5.0, f"[depth] unsupported encoding: {msg.encoding}")
+                return
 
-            if command == 'calibrate':
-                pixel_points = command_data.get('pixel_points', [])
-                galvo_points = command_data.get('galvo_points', [])
-
-                if self.coordinate_transform.calibrate_with_points(pixel_points, galvo_points):
-                    pass
-                    # rospy.loginfo("success calibration coordinate")
-                else:
-                    rospy.logerr("failed calibration coordinate")
-
-            elif command == 'save_config':
-                config_file = command_data.get('file', 'current_config.yaml')
-                self.coordinate_transform.save_config(config_file)
+            with self.depth_image_lock:
+                self.depth_image = depth_m
+                self.depth_image_encoding = msg.encoding
 
         except Exception as e:
-            rospy.logerr(f"failed calibration coordinate: {e}")
+            rospy.logwarn_throttle(5.0, f"[depth] failed to convert: {e}")
+
+    def depth_query_func(self, u, v):
+        """查询像素(u,v)的深度，单位：米。用于 coordinate_transform 中"""
+        with self.depth_image_lock:
+            if self.depth_image is None:
+                return None
+            H, W = self.depth_image.shape[:2]
+            if u < 0 or v < 0 or u >= W or v >= H:
+                return None
+            z = float(self.depth_image[int(round(v)), int(round(u))])
+            if not np.isfinite(z) or z <= 0:
+                return None
+            return z
+
+    def in_galvo_scan_range(self, u, v):
+        """判断像素点是否在振镜扫描范围内：用几何模型映射到码值并检查范围"""
+        try:
+            code = self.coordinate_transform.pixel_to_galvo_code(
+                float(u), float(v), self.image_width, self.image_height
+            )
+            if code is None:
+                return False
+            x, y = int(code[0]), int(code[1])
+            return (self.galvo_min <= x <= self.galvo_max) and (self.galvo_min <= y <= self.galvo_max)
+        except Exception:
+            return False
 
     def init_kalman_filter(self):
         """初始化简单的2D卡尔曼滤波器（位置+速度）"""
@@ -373,38 +424,17 @@ class LaserWeedingNode:
         self.kalman_filter.errorCovPost = np.eye(4, dtype=np.float32) * 100
 
     def update_targets(self, detections, current_time):
-        """更新目标信息"""
+        """更新目标信息（不入队，在 control_loop 中统一排序队列）"""
         current_frame_ids = set()
 
         for track_id, bbox, confidence in detections:
             if confidence < self.confidence_threshold:
                 continue
 
-            if track_id in self.processed_targets:
-                current_frame_ids.add(track_id)
-                x, y, w, h = bbox
-                cx = x + w / 2
-                cy = y + h / 2
-
-                if track_id not in self.all_targets:
-                    self.all_targets[track_id] = {
-                        'first_seen': current_time,
-                        'stable_frames': 0,
-                        'processed': True
-                    }
-
-                self.all_targets[track_id].update({
-                    'bbox': bbox,
-                    'center': [cx, cy],
-                    'confidence': confidence,
-                    'last_seen': current_time,
-                    'processed': True
-                })
-                continue
-
             x, y, w, h = bbox
-            cx = x + w / 2
-            cy = y + h / 2
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            current_frame_ids.add(track_id)
 
             if track_id not in self.all_targets:
                 self.all_targets[track_id] = {
@@ -413,64 +443,60 @@ class LaserWeedingNode:
                     'processed': False
                 }
 
+            # 已处理的目标更新基础信息后继续标记 processed
             self.all_targets[track_id].update({
                 'bbox': bbox,
                 'center': [cx, cy],
                 'confidence': confidence,
                 'last_seen': current_time,
-                'stable_frames': self.all_targets[track_id]['stable_frames'] + 1
             })
 
-            current_frame_ids.add(track_id)
-
-            if (track_id not in self.processed_targets and
-                    track_id not in self.target_queue and
-                    track_id != self.processing_target and
-                    (not self.current_target or self.current_target['id'] != track_id) and
-                    self.all_targets[track_id]['stable_frames'] >= self.min_stable_frames): #新目标
-                self.target_queue.append(track_id)
-                # rospy.loginfo(f"new target add in queue: ID {track_id}")
+            if track_id in self.processed_targets:
+                self.all_targets[track_id]['processed'] = True
+            else:
+                # 仅未处理目标累积稳定帧数
+                self.all_targets[track_id]['stable_frames'] = self.all_targets[track_id].get('stable_frames', 0) + 1
 
         # 清理超时目标
         to_remove = []
-        for tid, tinfo in self.all_targets.items():
+        for tid, tinfo in list(self.all_targets.items()):
             if tid not in current_frame_ids:
-                timeout = self.target_timeout * 3 if tid in self.processed_targets else self.target_timeout
-                if current_time - tinfo['last_seen'] > timeout:
+                timeout = self.target_timeout * (3 if tid in self.processed_targets else 1)
+                if current_time - tinfo.get('last_seen', current_time) > timeout:
                     to_remove.append(tid)
 
         for tid in to_remove:
-            del self.all_targets[tid]
-            if tid in self.target_queue:
-                self.target_queue.remove(tid)
-            if self.current_target and self.current_target['id'] == tid:
+            if tid in self.all_targets:
+                del self.all_targets[tid]
+            if self.current_target and self.current_target.get('id') == tid:
                 rospy.logwarn(f"current {tid} lost")
                 self.current_target = None
                 self.processing_target = None
                 self.change_state(SystemState.IDLE)
+            if tid in self.target_queue:
+                try:
+                    self.target_queue.remove(tid)
+                except ValueError:
+                    pass
 
     def update_position_history(self, position, timestamp):
         """更新位置历史并计算预测位置"""
-        # 添加到历史
         self.position_history.append({
             'position': position,
             'time': timestamp
         })
 
-        # 计算预测位置
         predicted_pos = self.predict_position(self.prediction_time)
 
         if predicted_pos:
             # 检查预测距离是否合理
             current_pos = position
-            distance = np.sqrt((predicted_pos[0] - current_pos[0]) ** 2 +
-                               (predicted_pos[1] - current_pos[1]) ** 2)
+            distance = np.hypot(predicted_pos[0] - current_pos[0],
+                                predicted_pos[1] - current_pos[1])
 
             if distance > self.max_prediction_distance:
-                rospy.logdebug(f"predict distance too far: {distance:.1f}px")
                 predicted_pos = current_pos
-
-            # 使用坐标变换（自动选择3D或简单模式）
+            # 使用坐标变换
             galvo_result = self.coordinate_transform.pixel_to_galvo_code(
                 predicted_pos[0], predicted_pos[1],
                 self.image_width, self.image_height
@@ -503,7 +529,7 @@ class LaserWeedingNode:
             except Exception as e:
                 rospy.logdebug(f"kalman predict failed: {e}")
 
-        # 简单线性预测（备用方案）
+        # 简单线性预测
         if len(self.position_history) >= 2:
             p1 = self.position_history[-2]
             p2 = self.position_history[-1]
@@ -529,13 +555,10 @@ class LaserWeedingNode:
                 with self.position_lock:
                     target_pos = self.target_galvo_position.copy()
 
-                # 计算移动距离        振镜目标位置-振镜当前位置
                 dx = target_pos[0] - self.galvo_position[0]
                 dy = target_pos[1] - self.galvo_position[1]
-                distance = np.sqrt(dx ** 2 + dy ** 2)
-                # 只有超过最小步长才移动
+                distance = np.hypot(dx, dy)
                 if distance > self.min_move_step:
-                    # 发送振镜命令给teensy
                     if self.galvo_controller:
                         self.galvo_controller.move_to_position(
                             int(target_pos[0]),
@@ -544,7 +567,6 @@ class LaserWeedingNode:
 
                     self.galvo_position = target_pos
 
-                    # 发布振镜位置
                     galvo_msg = Int32MultiArray()
                     galvo_msg.data = [
                         int(target_pos[0]),
@@ -565,9 +587,6 @@ class LaserWeedingNode:
         self.system_state = new_state
         self.state_start_time = time.time()
 
-        # rospy.loginfo(f"change state: {old_state.value} -> {new_state.value}")
-
-        # 根据状态控制激光和跟踪
         if new_state == SystemState.IDLE:
             self.tracking_active = False
             self.set_laser(False)
@@ -583,12 +602,10 @@ class LaserWeedingNode:
         if self.laser_on != enable:
             self.laser_on = enable
 
-            # 发布激光状态
             laser_msg = Bool()
             laser_msg.data = enable
             self.laser_pub.publish(laser_msg)
 
-            # 控制硬件
             if self.galvo_controller:
                 try:
                     if enable:
@@ -623,10 +640,6 @@ class LaserWeedingNode:
                     color = (0, 255, 255)  # 黄色：跟踪中
                     label = f"ID:{track_id} [tracking]"
                 thickness = 2
-            elif track_id in self.target_queue:
-                color = (255, 255, 0)  # 青色：队列中
-                label = f"ID:{track_id} [queue]"
-                thickness = 2
             else:
                 color = (0, 255, 0)  # 绿色：检测到
                 label = f"ID:{track_id}"
@@ -639,20 +652,17 @@ class LaserWeedingNode:
             cv2.putText(result, label, (int(x), int(y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-            # 为当前目标绘制预测瞄准点
-            if track_id == (self.current_target['id'] if self.current_target else None):
-                # 获取预测位置
-                predicted_pos = self.predict_position(self.prediction_time)
-                if predicted_pos:
-                    # 绘制预测位置
-                    cv2.circle(result, (int(predicted_pos[0]), int(predicted_pos[1])),
-                               6, (255, 0, 255), 2)
-                    cv2.putText(result, "PRED", (int(predicted_pos[0] + 10), int(predicted_pos[1])),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            # # 当前目标的预测瞄准点
+            # if track_id == (self.current_target['id'] if self.current_target else None):
+            #     predicted_pos = self.predict_position(self.prediction_time)
+            #     if predicted_pos:
+            #         cv2.circle(result, (int(predicted_pos[0]), int(predicted_pos[1])),
+            #                    6, (255, 0, 255), 2)
+            #         cv2.putText(result, "PRED", (int(predicted_pos[0] + 10), int(predicted_pos[1])),
+            #                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-        # 绘制振镜激光实际瞄准位置（使用正确的反向变换）
-        try:
-            # 使用坐标变换器的反向变换方法
+        # 绘制振镜激光实际瞄准位置
+        try:    #最开始是因为没有读到深度,用的是给定的深度值,所以可视化中瞄准的不准确
             galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
                 self.galvo_position[0], self.galvo_position[1],
                 self.image_width, self.image_height
@@ -660,123 +670,47 @@ class LaserWeedingNode:
 
             if galvo_pixel is not None:
                 color = (0, 0, 255) if self.laser_on else (255, 255, 0)
+                xg = int(round(galvo_pixel[0]))
+                yg = int(round(galvo_pixel[1]))
 
-                # 绘制十字准线
-                cv2.line(result,
-                         (int(galvo_pixel[0] - 15), int(galvo_pixel[1])),
-                         (int(galvo_pixel[0] + 15), int(galvo_pixel[1])),
-                         color, 3)
-                cv2.line(result,
-                         (int(galvo_pixel[0]), int(galvo_pixel[1] - 15)),
-                         (int(galvo_pixel[0]), int(galvo_pixel[1] + 15)),
-                         color, 3)
-                cv2.circle(result,
-                           (int(galvo_pixel[0]), int(galvo_pixel[1])),
-                           10, color, 2)
+                cv2.line(result, (xg - 15, yg), (xg + 15, yg), color, 3)
+                cv2.line(result, (xg, yg - 15), (xg, yg + 15), color, 3)
+                cv2.circle(result, (xg, yg), 10, color, 2)
 
-                # 显示激光状态文字
                 laser_status = "LASER ON" if self.laser_on else "AIM"
-                cv2.putText(result, laser_status,
-                            (int(galvo_pixel[0] + 20), int(galvo_pixel[1] - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(result, laser_status, (xg + 20, yg - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-                # 显示坐标信息
                 coord_text = f"({self.galvo_position[0]:.0f},{self.galvo_position[1]:.0f})"
-                cv2.putText(result, coord_text,
-                            (int(galvo_pixel[0] + 20), int(galvo_pixel[1] + 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                pixel_text = f"{xg:.0f},{yg:.0f}"
+                cv2.putText(result, coord_text, (xg + 20, yg + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                cv2.putText(result, pixel_text, (xg + 20, yg + 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
             else:
-                # 如果反向变换失败，显示警告
                 cv2.putText(result, "GALVO POS UNKNOWN", (10, 150),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         except Exception as e:
             rospy.logdebug(f"Failed to draw galvo position: {e}")
-            # 回退到简单显示
             cv2.putText(result, "GALVO DISPLAY ERROR", (10, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        # 显示状态信息
         status_text = f"State: {self.system_state.value}"
         cv2.putText(result, status_text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        # # 显示坐标变换信息
-        # transform_info = self.coordinate_transform.get_transform_info()
-        # mode_text = f"Transform: {'3D geometric' if transform_info['use_3d_transform'] else 'Simple mapping'}"
-        # cv2.putText(result, mode_text, (10, image.shape[0] - 120),
-        #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        # if transform_info['use_3d_transform'] and 'camera_position' in transform_info:
-        #     # 显示3D变换相关信息
-        #     transform_valid_text = f"3D valid: {'YES' if transform_info['transform_valid'] else 'NO'}"
-        #     cv2.putText(result, transform_valid_text, (10, image.shape[0] - 90),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-        #                 (0, 255, 0) if transform_info['transform_valid'] else (0, 0, 255), 1)
-        #
-        #     # 显示相机位置信息
-        #     cam_pos = transform_info['camera_position']
-        #     cam_text = f"Cam pos: ({cam_pos[0]:.0f}, {cam_pos[1]:.0f}, {cam_pos[2]:.0f})mm"
-        #     cv2.putText(result, cam_text, (10, image.shape[0] - 60),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        #
-        #     # 显示工作距离
-        #     work_dist = transform_info['work_plane_distance']
-        #     dist_text = f"Work dist: {abs(work_dist):.0f}mm"
-        #     cv2.putText(result, dist_text, (10, image.shape[0] - 30),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        # else:
-        #     # 显示简单映射相关信息
-        #     simple_info = transform_info.get('simple_mapping', {})
-        #     simple_text = f"Simple: scale={simple_info.get('scale_factor', 60000)}"
-        #     cv2.putText(result, simple_text, (10, image.shape[0] - 60),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        # # 显示使用的变换方法
-        # if 'transform_method' in transform_info:
-        #     method_text = f"Method: {transform_info['transform_method']}"
-        #     cv2.putText(result, method_text, (10, image.shape[0] - 30),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-
-        # # 显示FPS
-        # if len(self.fps_counter) > 1:
-        #     fps = len(self.fps_counter) / (self.fps_counter[-1] - self.fps_counter[0])
-        #     fps_text = f"FPS: {fps:.1f}"
-        #     cv2.putText(result, fps_text, (10, 60),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        #
-        # # 显示队列信息
-        # queue_text = f"Queue: {len(self.target_queue)} | Processed: {len(self.processed_targets)}"
-        # cv2.putText(result, queue_text, (10, 90),
-        #             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        #
-        # # 添加调试信息
-        # if self.processing_target:
-        #     debug_text = f"Processing: {self.processing_target}"
-        #     cv2.putText(result, debug_text, (10, 120),
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-
         return result
-
-    def galvo_to_pixel_simple(self, galvo_x, galvo_y):
-        """振镜坐标转像素坐标（简单线性映射，用于显示）"""
-        # 这是简化的反向映射，仅用于可视化
-        pixel_x = (galvo_x / 65535 + 0.5) * self.image_width
-        pixel_y = (galvo_y / 65535 + 0.5) * self.image_height
-        return [pixel_x, pixel_y]
 
     def publish_status(self, event):
         """发布系统状态"""
         try:
-            # 计算FPS
             fps = 0
             if len(self.fps_counter) > 1:
                 fps = len(self.fps_counter) / (self.fps_counter[-1] - self.fps_counter[0])
 
-            # 获取变换信息
             transform_info = self.coordinate_transform.get_transform_info()
 
-            # 构建状态信息
             status_info = {
                 'state': self.system_state.value,
                 'current_target': self.current_target['id'] if self.current_target else None,
@@ -794,17 +728,14 @@ class LaserWeedingNode:
                 'camera_info_received': self.camera_info_received
             }
 
-            # 发布状态
             status_msg = String()
             status_msg.data = json.dumps(status_info)
             self.status_pub.publish(status_msg)
 
-            # 发布变换信息
             transform_msg = String()
             transform_msg.data = json.dumps(transform_info)
             self.transform_pub.publish(transform_msg)
 
-            # 发布当前目标信息
             if self.current_target and self.current_target['id'] in self.all_targets:
                 target_info = self.all_targets[self.current_target['id']]
                 target_data = {
@@ -817,20 +748,6 @@ class LaserWeedingNode:
                 target_msg.data = json.dumps(target_data)
                 self.target_pub.publish(target_msg)
 
-            # 打印简要状态
-            mode_str = "3D" if transform_info['use_3d_transform'] else "easy"
-            method_str = transform_info.get('transform_method', 'Unknown')
-
-            # rospy.loginfo(
-            #     f"状态: {self.system_state.value} | "
-            #     f"FPS: {fps:.1f} | "
-            #     f"队列: {len(self.target_queue)} | "
-            #     f"已处理: {len(self.processed_targets)} | "
-            #     f"当前: {self.current_target['id'] if self.current_target else 'None'} | "
-            #     f"激光: {'开' if self.laser_on else '关'} | "
-            #     f"变换: {mode_str}({method_str})"
-            # )
-
         except Exception as e:
             rospy.logerr(f"failed publish status: {e}")
 
@@ -838,10 +755,8 @@ class LaserWeedingNode:
         """析构函数"""
         self.running = False
 
-        # 关闭激光
         self.set_laser(False)
 
-        # 关闭振镜控制器
         if hasattr(self, 'galvo_controller') and self.galvo_controller:
             try:
                 self.galvo_controller.close()
