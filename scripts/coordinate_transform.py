@@ -8,6 +8,17 @@ import cv2
 from onnx.reference.ops.op_non_max_suppression import PrepareContext
 from scipy.spatial.transform import Rotation
 import os
+from dataclasses import dataclass
+
+@dataclass
+class GalvoParams:
+    Z_mm: float = 107.0          # 工作面参考距离（正向时会用实时 point_g[2] 覆盖）
+    bx: float = 0.0             # code 偏置
+    by: float = 0.0
+    kx: float = 0.0             # alpha <- cx
+    ky: float = 0.0             # beta  <- cy
+    axy: float = -1.236e-5      # alpha <- cy
+    ayx: float = -1.218e-5      # beta  <- cx
 
 
 class CameraGalvoTransform:
@@ -59,7 +70,15 @@ class CameraGalvoTransform:
                 'scale_factor': 65536,
                 'offset_x': 0,
                 'offset_y': 0,
+            },
+            'mech_compensation': {
+                'enabled': True,
+                'Z_mm': 76.0,
+                'bx': 0.0, 'by': 0.0,
+                'kx': 0.0, 'ky': 0.0,
+                'axy': -1.236e-5, 'ayx': -1.218e-5
             }
+
         }
 
         self.load_config(config_file)
@@ -84,9 +103,12 @@ class CameraGalvoTransform:
         # 可选的固定深度面（振镜系 z = const，单位 mm）
         self.fixed_reverse_depth_z_mm = None
 
-
         self.reverse_theta_x = None
         self.reverse_theta_y = None
+
+        # 机械畸变补偿
+        self.use_mech_compensation = True
+        self.galvo_lin = GalvoParams()
 
         rospy.loginfo("Camera-galvo coordinate transformer initialized successfully")
 
@@ -99,6 +121,18 @@ class CameraGalvoTransform:
             try:
                 with open(config_file, 'r') as f:
                     config = yaml.safe_load(f)
+                    # 读取机械补偿参数
+                    mc = self.params.get('mech_compensation', {})
+                    self.use_mech_compensation = bool(mc.get('enabled', True))
+                    self.galvo_lin = GalvoParams(
+                        Z_mm=float(mc.get('Z_mm', 76.0)),
+                        bx=float(mc.get('bx', 0.0)),
+                        by=float(mc.get('by', 0.0)),
+                        kx=float(mc.get('kx', 0.0)),
+                        ky=float(mc.get('ky', 0.0)),
+                        axy=float(mc.get('axy', -1.236e-5)),
+                        ayx=float(mc.get('ayx', -1.218e-5)),
+                    )
                     self.update_params_recursive(self.params, config)
 
                 if 'transform_mode' in config:
@@ -114,6 +148,16 @@ class CameraGalvoTransform:
                 self.update_params_recursive(default_dict[key], value)
             else:
                 default_dict[key] = value
+
+    def enable_mech_compensation(self, enabled: bool):
+        self.use_mech_compensation = bool(enabled)
+        rospy.loginfo(f"Mechanical compensation set to: {self.use_mech_compensation}")
+
+    def set_galvo_compensation_params(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self.galvo_lin, k):
+                setattr(self.galvo_lin, k, float(v))
+        rospy.loginfo(f"Updated mechanical compensation params: {self.galvo_lin}")
 
     def init_3d_transform(self):
         try:
@@ -322,6 +366,38 @@ class CameraGalvoTransform:
 
         return code_x, code_y
 
+    @staticmethod
+    def _angles_yfirst_from_plane(X_mm, Y_mm, Z_mm):
+        # alpha 先（Y/Z），beta 后（X/Z * cos(alpha)）
+        Z = float(Z_mm)
+        alpha = np.arctan2(Y_mm, Z)
+        ca = np.cos(alpha)
+        beta = np.arctan2((X_mm / Z) * ca, 1.0)
+        return alpha, beta
+
+    def angles_to_codes_mech(self, alpha, beta):
+        # [alpha; beta] = [[kx, axy],[ayx, ky]] * ([cx-bx; cy-by])  的反解
+        p = self.galvo_lin
+        A11, A12 = p.kx, p.axy
+        A21, A22 = p.ayx, p.ky
+        det = A11 * A22 - A12 * A21
+        alpha = float(alpha);
+        beta = float(beta)
+
+        if abs(det) < 1e-16:
+            cx = p.bx + beta / (p.ayx if abs(p.ayx) > 1e-16 else -1e-5)
+            cy = p.by + alpha / (p.axy if abs(p.axy) > 1e-16 else -1e-5)
+        else:
+            dcx = (A22 * alpha - A12 * beta) / det
+            dcy = (-A21 * alpha + A11 * beta) / det
+            cx = p.bx + dcx
+            cy = p.by + dcy
+
+        cx = int(np.clip(np.rint(cx), -32767, 32767))
+        cy = int(np.clip(np.rint(cy), -32767, 32767))
+        return cx, cy
+
+
     def pixel_to_galvo_3d(self, pixel_x, pixel_y, image_width, image_height):
         try:
             # 优先使用深度
@@ -338,8 +414,14 @@ class CameraGalvoTransform:
                         # 缓存命中点供反向映射使用
                         self.last_hit_point_g = point_g.copy()
 
-                        theta_x, theta_y = self.point_to_galvo_angles(point_g)
-                        code_x, code_y = self.angles_to_codes(theta_x, theta_y)
+                        if self.use_mech_compensation:
+                            alpha, beta = self._angles_yfirst_from_plane(point_g[0], point_g[1], point_g[2])
+                            theta_y, theta_x = alpha, beta
+                            code_x, code_y = self.angles_to_codes_mech(theta_x, theta_y)
+                        else:
+                            theta_x, theta_y = self.point_to_galvo_angles(point_g)
+                            code_x, code_y = self.angles_to_codes(theta_x, theta_y)
+
                         self.last_pixel_pos = (pixel_x, pixel_y)
                         self.last_galvo_pos = (code_x, code_y)
                         # print("codex,codey",code_x,code_y)
@@ -415,6 +497,15 @@ class CameraGalvoTransform:
 
         return theta_x, theta_y
 
+
+    def codes_to_angles_mech(self, cx, cy):
+        # 直接乘矩阵： [alpha; beta] = M * ([cx;cy] - [bx;by])
+        p = self.galvo_lin
+        v = np.array([float(cx) - p.bx, float(cy) - p.by], dtype=float)
+        M = np.array([[p.kx, p.axy],
+                      [p.ayx, p.ky]], dtype=float)
+        alpha, beta = (M @ v).tolist()
+        return alpha, beta
 
     def galvo_angles_to_point_on_plane(self, theta_x, theta_y):
         """
@@ -520,7 +611,13 @@ class CameraGalvoTransform:
         """
         try:
             # print("galvo x,y", galvo_x, galvo_y)
-            theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
+            if self.use_mech_compensation:
+                alpha, beta = self.codes_to_angles_mech(galvo_x, galvo_y)
+                # 对应关系：alpha -> theta_y, beta -> theta_x
+                theta_y, theta_x = alpha, beta
+            else:
+                theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
+
             # print("galvo 2 pixel thetax,y",theta_x,theta_y)
             max_code = self.params['galvo_params']['max_code']
             # if abs(galvo_x) >= max_code - 1 or abs(galvo_y) >= max_code - 1:
