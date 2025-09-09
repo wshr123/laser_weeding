@@ -87,7 +87,7 @@
         <param name="image_width" value="640" />
         <param name="image_height" value="480" />
         <param name="image_topic" value="/camera/image_raw" />
-        <param name="camera_info_topic" value="/camera/camera_info" />
+        <param name="camera_info_topic" value="/camera/camera_info"/>
 
         <!-- 目标管理 -->
         <param name="target_timeout" value="0.3" />
@@ -95,7 +95,7 @@
 
         <!-- ========== 坐标变换模式选择 ========== -->
         <!-- true: 使用3D几何变换, false: 使用简单线性映射（原始方法）-->
-        <param name="use_3d_transform" value="true" />
+        <param name="use_3d_transform" value="false" />
 
         <!-- 3D变换配置文件路径（仅3D模式时需要）-->
         <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
