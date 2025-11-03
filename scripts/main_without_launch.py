@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+import pyrealsense2 as rs
+from std_msgs.msg import Header
 import sys
 import os
 import traceback
@@ -167,13 +169,13 @@ class LaserWeedingNode:
 
 
             # 订阅
-            image_topic = rospy.get_param('~image_topic', '/camera/image_raw')
-            self.image_sub = rospy.Subscriber(
-                image_topic,
-                Image,
-                self.image_callback,
-                queue_size=1
-            )
+            # image_topic = rospy.get_param('~image_topic', '/camera/image_raw')
+            # self.image_sub = rospy.Subscriber(
+            #     image_topic,
+            #     Image,
+            #     self.image_callback,
+            #     queue_size=1
+            # )
 
             # 标定和控制相关订阅器
             # self.calibration_sub = rospy.Subscriber(
@@ -187,15 +189,15 @@ class LaserWeedingNode:
             self.depth_image = None
             self.depth_image_encoding = None
             self.depth_image_lock = threading.Lock()
-            depth_topic = rospy.get_param("~depth_topic", "/camera/aligned_depth_to_color/image_raw")
-            self.depth_sub = rospy.Subscriber(
-                depth_topic,
-                Image,
-                self.depth_image_callback,
-                queue_size=1,
-                buff_size=2 ** 24
-            )
-            rospy.loginfo(f"subscribed to depth topic: {depth_topic}")
+            # depth_topic = rospy.get_param("~depth_topic", "/camera/aligned_depth_to_color/image_raw")
+            # self.depth_sub = rospy.Subscriber(
+            #     depth_topic,
+            #     Image,
+            #     self.depth_image_callback,
+            #     queue_size=1,
+            #     buff_size=2 ** 24
+            # )
+            # rospy.loginfo(f"subscribed to depth topic: {depth_topic}")
             # 设置 query 函数给变换器
             self.coordinate_transform.set_depth_query(self.depth_query_func)
 
@@ -203,6 +205,25 @@ class LaserWeedingNode:
             self.galvo_thread = threading.Thread(target=self.galvo_control_loop)
             self.galvo_thread.daemon = True
             self.galvo_thread.start()
+
+            # === RealSense 直连采集参数 ===
+            self.rs_color_w = rospy.get_param('~rs_color_width', 1280)
+            self.rs_color_h = rospy.get_param('~rs_color_height', 720)
+            self.rs_depth_w = rospy.get_param('~rs_depth_width', 640)  # 建议先低一点
+            self.rs_depth_h = rospy.get_param('~rs_depth_height', 480)
+            self.rs_fps = rospy.get_param('~rs_fps', 30)
+            self.rs_align = rospy.get_param('~rs_align_to_color', False)  # 先关掉对齐，延迟更低
+            self.rs_publish_raw = rospy.get_param('~rs_publish_raw', True)  # 是否再发布RGB/Depth供RViz看
+
+            # === 发布raw流给RViz（队列=1，不堆帧） ===
+            if self.rs_publish_raw:
+                self.rs_color_pub = rospy.Publisher('/camera/color/image_raw', Image, queue_size=1)
+                self.rs_color_info_pub = rospy.Publisher('/camera/color/camera_info', CameraInfo, queue_size=1)
+                self.rs_depth_pub = rospy.Publisher('/camera/depth/image_rect_raw', Image, queue_size=1)
+                self.rs_depth_info_pub = rospy.Publisher('/camera/depth/camera_info', CameraInfo, queue_size=1)
+
+            # === 启动 RealSense 线程 ===
+            self.start_realsense_thread()
 
             # 主控制定时器
             self.control_timer = rospy.Timer(
@@ -225,59 +246,193 @@ class LaserWeedingNode:
             rospy.logerr(traceback.format_exc())
             sys.exit(1)
 
+    def start_realsense_thread(self):
+        """启动 pyrealsense2 采集线程"""
+        self.rs_bridge = CvBridge()
+        self.rs_pipeline = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, self.rs_color_w, self.rs_color_h, rs.format.bgr8, self.rs_fps)
+        cfg.enable_stream(rs.stream.depth, self.rs_depth_w, self.rs_depth_h, rs.format.z16, self.rs_fps)
 
+        self.rs_profile = self.rs_pipeline.start(cfg)
 
-    def image_callback(self, msg):
-        try:
+        # 压低设备端队列：极致“丢旧保新”
+        dev = self.rs_profile.get_device()
+        for s in dev.sensors:
+            if s.supports(rs.option.frames_queue_size):
+                s.set_option(rs.option.frames_queue_size, 1)
 
-            t0 = msg.header.stamp  # 相机采集时刻
-            t1 = rospy.Time.now()  # 回调刚收到的时刻
-            # self.img_pub.publish(msg)
-            # 转换图像
-            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            self.current_image = cv_image
+        # 获取内参，构造 CameraInfo（一次性）
+        color_stream = self.rs_profile.get_stream(rs.stream.color).as_video_stream_profile()
+        depth_stream = self.rs_profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        self.rs_color_intr = color_stream.get_intrinsics()
+        self.rs_depth_intr = depth_stream.get_intrinsics()
+        self.rs_color_info = self._make_camera_info_from_intr(self.rs_color_intr, 'camera_color_optical_frame')
+        self.rs_depth_info = self._make_camera_info_from_intr(self.rs_depth_intr, 'camera_depth_optical_frame')
 
-            # 更新图像尺寸（如果变化）
-            h, w = cv_image.shape[:2]
-            if w != self.image_width or h != self.image_height:
-                self.image_width = w
-                self.image_height = h
-                rospy.loginfo(f"update image size: {w}x{h}")
+        # 可选对齐器（建议先不开，以最低延迟为目标）
+        self.rs_align_obj = rs.align(rs.stream.color) if self.rs_align else None
 
-            # FPS计算
-            current_time = time.time()
-            self.fps_counter.append(current_time)
-            self.frame_count += 1
+        # 共享帧缓存
+        self.current_image = None
+        with self.depth_image_lock:
+            self.depth_image = None
+            self.depth_image_encoding = '32FC1'
+        self.last_color_stamp = None
+        self.depth_stamp = None
 
-            # 检测和跟踪
-            result_image, detections = self.detector.detect_and_track_weeds(cv_image)
-            t2 = rospy.Time.now()
-            # 更新目标
-            self.update_targets(detections, current_time)
+        # 线程
+        self.rs_running = True
+        self.rs_thread = threading.Thread(target=self._rs_loop, daemon=True)
+        self.rs_thread.start()
+        rospy.loginfo("RealSense thread started.")
 
-            # 绘制信息
-            result_image = self.draw_info(result_image)
+    def _rs_loop(self):
+        rate = rospy.Rate(self.rs_fps)
+        while self.rs_running and not rospy.is_shutdown():
+            # 非阻塞抓帧 + 排干旧帧，只留最新
+            frames = self.rs_pipeline.poll_for_frames()
+            if not frames:
+                rate.sleep()
+                continue
+            while True:
+                nxt = self.rs_pipeline.poll_for_frames()
+                if nxt:
+                    frames = nxt
+                else:
+                    break
 
-            # 发布检测结果图像
-            if self.frame_count % 1 == 0:
+            if self.rs_align_obj is not None:
+                frames = self.rs_align_obj.process(frames)
+
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+            if not color_frame or not depth_frame:
+                rate.sleep()
+                continue
+
+            color_img = np.asanyarray(color_frame.get_data())
+            depth_z16 = np.asanyarray(depth_frame.get_data())  # mm, uint16
+            depth_m = depth_z16.astype(np.float32) / 1000.0  # 转米
+
+            # 记录时间戳用系统时间（可视化友好）
+            stamp = rospy.Time.now()
+            self.last_color_stamp = stamp
+            self.depth_stamp = stamp
+
+            # 更新共享缓存（供检测/几何使用）
+            self.current_image = color_img
+            with self.depth_image_lock:
+                self.depth_image = depth_m
+                self.depth_image_encoding = '32FC1'
+
+            # 直接在这里走你的检测与发布（替代原 image_callback）
+            try:
+                result_image, detections = self.detector.detect_and_track_weeds(color_img)
+                now = time.time()
+                self.update_targets(detections, now)
+                result_image = self.draw_info(result_image)
+
+                # 发布可视化检测图（沿用你已有的 det_img_pub）
+                det_msg = self.rs_bridge.cv2_to_imgmsg(result_image, "bgr8")
+                det_msg.header.stamp = stamp
+                det_msg.header.frame_id = "camera_color_optical_frame"
+                self.det_img_pub.publish(det_msg)
+            except Exception as e:
+                rospy.logdebug(f"det/publish in rs loop failed: {e}")
+
+            # 可选：发布 raw RGB/Depth + CameraInfo 给 RViz
+            if self.rs_publish_raw:
                 try:
-                    det_msg = self.bridge.cv2_to_imgmsg(result_image, "bgr8")
-                    det_msg.header.stamp = msg.header.stamp
-                    det_msg.header.frame_id = msg.header.frame_id
+                    # color
+                    color_msg = self.rs_bridge.cv2_to_imgmsg(color_img, "bgr8")
+                    color_msg.header = Header(stamp=stamp, frame_id="camera_color_optical_frame")
+                    ci = self.rs_color_info;
+                    ci.header.stamp = stamp
+                    self.rs_color_pub.publish(color_msg)
+                    self.rs_color_info_pub.publish(ci)
 
-                    cam_cb_ms = (t1 - t0).to_sec() * 1000.0  # 相机 → 回调
-                    proc_ms = (t2 - t1).to_sec() * 1000.0  # 你的处理
-                    end2end_ms = (rospy.Time.now() - t0).to_sec() * 1000.0  # 端到端（发布前一刻）
+                    # depth（不对齐时用 depth_optical_frame）
+                    depth_msg = self.rs_bridge.cv2_to_imgmsg(depth_z16, "16UC1")
+                    dfid = "camera_color_optical_frame" if self.rs_align else "camera_depth_optical_frame"
+                    depth_msg.header = Header(stamp=stamp, frame_id=dfid)
+                    di = self.rs_color_info if self.rs_align else self.rs_depth_info
+                    di.header.stamp = stamp
+                    self.rs_depth_pub.publish(depth_msg)
+                    self.rs_depth_info_pub.publish(di)
+                except Exception as e:
+                    rospy.logdebug(f"raw publish failed: {e}")
 
-                    rospy.loginfo_throttle(1.0,
-                                           f"cam->cb={cam_cb_ms:.1f}ms  proc={proc_ms:.1f}ms  end2end~{end2end_ms:.1f}ms")
+            rate.sleep()
 
-                    self.det_img_pub.publish(det_msg)
+    def _make_camera_info_from_intr(self, intr, frame_id):
+        msg = CameraInfo()
+        msg.width = intr.width
+        msg.height = intr.height
+        msg.distortion_model = "plumb_bob"
+        msg.K = [intr.fx, 0.0, intr.ppx,
+                 0.0, intr.fy, intr.ppy,
+                 0.0, 0.0, 1.0]
+        # rs intrinsics.coeffs 可能返回5个[k1,k2,p1,p2,k3]
+        msg.D = list(intr.coeffs)
+        msg.R = [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        msg.P = [intr.fx, 0.0, intr.ppx, 0.0,
+                 0.0, intr.fy, intr.ppy, 0.0,
+                 0.0, 0.0, 1.0, 0.0]
+        msg.header.frame_id = frame_id
+        return msg
 
-                except CvBridgeError as e:
-                    rospy.logerr(f"det_img publish failed: {e}")
-        except Exception as e:
-            rospy.logerr(f"image callback error: {e}")
+    # def image_callback(self, msg):
+    #     try:
+    #
+    #         t0 = msg.header.stamp  # 相机采集时刻
+    #         t1 = rospy.Time.now()  # 回调刚收到的时刻
+    #         # self.img_pub.publish(msg)
+    #         # 转换图像
+    #         cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+    #         self.current_image = cv_image
+    #
+    #         # 更新图像尺寸（如果变化）
+    #         h, w = cv_image.shape[:2]
+    #         if w != self.image_width or h != self.image_height:
+    #             self.image_width = w
+    #             self.image_height = h
+    #             rospy.loginfo(f"update image size: {w}x{h}")
+    #
+    #         # FPS计算
+    #         current_time = time.time()
+    #         self.fps_counter.append(current_time)
+    #         self.frame_count += 1
+    #
+    #         # 检测和跟踪
+    #         result_image, detections = self.detector.detect_and_track_weeds(cv_image)
+    #         t2 = rospy.Time.now()
+    #         # 更新目标
+    #         self.update_targets(detections, current_time)
+    #
+    #         # 绘制信息
+    #         result_image = self.draw_info(result_image)
+    #
+    #         # 发布检测结果图像
+    #         if self.frame_count % 1 == 0:
+    #             try:
+    #                 det_msg = self.bridge.cv2_to_imgmsg(result_image, "bgr8")
+    #                 det_msg.header.stamp = msg.header.stamp
+    #                 det_msg.header.frame_id = msg.header.frame_id
+    #
+    #                 cam_cb_ms = (t1 - t0).to_sec() * 1000.0  # 相机 → 回调
+    #                 proc_ms = (t2 - t1).to_sec() * 1000.0  # 你的处理
+    #                 end2end_ms = (rospy.Time.now() - t0).to_sec() * 1000.0  # 端到端（发布前一刻）
+    #
+    #                 rospy.loginfo_throttle(1.0,
+    #                                        f"cam->cb={cam_cb_ms:.1f}ms  proc={proc_ms:.1f}ms  end2end~{end2end_ms:.1f}ms")
+    #
+    #                 self.det_img_pub.publish(det_msg)
+    #
+    #             except CvBridgeError as e:
+    #                 rospy.logerr(f"det_img publish failed: {e}")
+    #     except Exception as e:
+    #         rospy.logerr(f"image callback error: {e}")
 
     def control_loop(self, event):
         try:
@@ -375,27 +530,40 @@ class LaserWeedingNode:
         except Exception as e:
             rospy.logerr(f"control loop failed: {e}")
 
-    def depth_image_callback(self, msg):
-        """深度图回调：自动缓存为 numpy 格式 米"""
-        try:
-            depth_cv = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-            if msg.encoding == '16UC1':
-                depth_m = depth_cv.astype(np.float32) / 1000.0
-            elif msg.encoding == '32FC1':
-                depth_m = depth_cv.astype(np.float32)
-            else:
-                rospy.logwarn_throttle(5.0, f"[depth] unsupported encoding: {msg.encoding}")
-                return
+    # def depth_image_callback(self, msg):
+    #     """深度图回调：自动缓存为 numpy 格式 米"""
+    #     try:
+    #         depth_cv = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+    #         if msg.encoding == '16UC1':
+    #             depth_m = depth_cv.astype(np.float32) / 1000.0
+    #         elif msg.encoding == '32FC1':
+    #             depth_m = depth_cv.astype(np.float32)
+    #         else:
+    #             rospy.logwarn_throttle(5.0, f"[depth] unsupported encoding: {msg.encoding}")
+    #             return
+    #
+    #         with self.depth_image_lock:
+    #             self.depth_image = depth_m
+    #             self.depth_image_encoding = msg.encoding
+    #
+    #     except Exception as e:
+    #         rospy.logwarn_throttle(5.0, f"[depth] failed to convert: {e}")
 
-            with self.depth_image_lock:
-                self.depth_image = depth_m
-                self.depth_image_encoding = msg.encoding
-
-        except Exception as e:
-            rospy.logwarn_throttle(5.0, f"[depth] failed to convert: {e}")
+    # def depth_query_func(self, u, v):
+    #     """查询像素(u,v)的深度，单位：米。用于 coordinate_transform 中"""
+    #     with self.depth_image_lock:
+    #         if self.depth_image is None:
+    #             return None
+    #         H, W = self.depth_image.shape[:2]
+    #         if u < 0 or v < 0 or u >= W or v >= H:
+    #             return None
+    #         z = float(self.depth_image[int(round(v)), int(round(u))])
+    #         if not np.isfinite(z) or z <= 0:
+    #             return None
+    #         return z
 
     def depth_query_func(self, u, v):
-        """查询像素(u,v)的深度，单位：米。用于 coordinate_transform 中"""
+        """查询像素(u,v)的深度（米）——直接从 RealSense 线程缓存读取"""
         with self.depth_image_lock:
             if self.depth_image is None:
                 return None
@@ -403,9 +571,7 @@ class LaserWeedingNode:
             if u < 0 or v < 0 or u >= W or v >= H:
                 return None
             z = float(self.depth_image[int(round(v)), int(round(u))])
-            if not np.isfinite(z) or z <= 0:
-                return None
-            return z
+            return z if np.isfinite(z) and z > 0 else None
 
     def in_galvo_scan_range(self, u, v):
         """判断像素点是否在振镜扫描范围内：用几何模型映射到码值并检查范围"""
@@ -772,15 +938,18 @@ class LaserWeedingNode:
     def __del__(self):
         """析构函数"""
         self.running = False
-
+        self.rs_running = False
+        try:
+            if hasattr(self, 'rs_pipeline'):
+                self.rs_pipeline.stop()
+        except Exception:
+            pass
         self.set_laser(False)
-
         if hasattr(self, 'galvo_controller') and self.galvo_controller:
             try:
                 self.galvo_controller.close()
             except:
                 pass
-
         rospy.loginfo("close laser weeding node")
 
 

@@ -10,7 +10,6 @@ from scipy.spatial.transform import Rotation
 import os
 from dataclasses import dataclass
 
-
 @dataclass
 class GalvoParams:
     Z_mm: float = 107.0          # 工作面参考距离（正向时会用实时 point_g[2] 覆盖）
@@ -18,8 +17,9 @@ class GalvoParams:
     by: float = 0.0
     kx: float = 0.0             # alpha <- cx
     ky: float = 0.0             # beta  <- cy
-    axy: float = -1.298e-5      # alpha <- cy
-    ayx: float = -1.269e-5      # beta  <- cx
+    axy: float = -1.236e-5      # alpha <- cy
+    ayx: float = -1.218e-5      # beta  <- cx
+
 
 class CameraGalvoTransform:
     """
@@ -70,7 +70,15 @@ class CameraGalvoTransform:
                 'scale_factor': 65536,
                 'offset_x': 0,
                 'offset_y': 0,
+            },
+            'mech_compensation': {
+                'enabled': True,
+                'Z_mm': 76.0,
+                'bx': 0.0, 'by': 0.0,
+                'kx': 0.0, 'ky': 0.0,
+                'axy': -1.236e-5, 'ayx': -1.218e-5
             }
+
         }
 
         self.load_config(config_file)
@@ -95,10 +103,13 @@ class CameraGalvoTransform:
         # 可选的固定深度面（振镜系 z = const，单位 mm）
         self.fixed_reverse_depth_z_mm = None
 
-
         self.reverse_theta_x = None
         self.reverse_theta_y = None
+
+        # 机械畸变补偿
+        self.use_mech_compensation = False
         self.galvo_lin = GalvoParams()
+
         rospy.loginfo("Camera-galvo coordinate transformer initialized successfully")
 
     # -------------------- 参数与初始化 --------------------
@@ -110,6 +121,17 @@ class CameraGalvoTransform:
             try:
                 with open(config_file, 'r') as f:
                     config = yaml.safe_load(f)
+                    # 读取机械补偿参数
+                    mc = self.params.get('mech_compensation', {})
+                    self.galvo_lin = GalvoParams(
+                        Z_mm=float(mc.get('Z_mm', 76.0)),
+                        bx=float(mc.get('bx', 0.0)),
+                        by=float(mc.get('by', 0.0)),
+                        kx=float(mc.get('kx', 0.0)),
+                        ky=float(mc.get('ky', 0.0)),
+                        axy=float(mc.get('axy', -1.236e-5)),
+                        ayx=float(mc.get('ayx', -1.218e-5)),
+                    )
                     self.update_params_recursive(self.params, config)
 
                 if 'transform_mode' in config:
@@ -125,6 +147,16 @@ class CameraGalvoTransform:
                 self.update_params_recursive(default_dict[key], value)
             else:
                 default_dict[key] = value
+
+    def enable_mech_compensation(self, enabled: bool):
+        self.use_mech_compensation = bool(enabled)
+        rospy.loginfo(f"Mechanical compensation set to: {self.use_mech_compensation}")
+
+    def set_galvo_compensation_params(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self.galvo_lin, k):
+                setattr(self.galvo_lin, k, float(v))
+        rospy.loginfo(f"Updated mechanical compensation params: {self.galvo_lin}")
 
     def init_3d_transform(self):
         try:
@@ -166,8 +198,7 @@ class CameraGalvoTransform:
         self.t_fix = np.array(ext_fix['t_fix'], dtype=np.float64)
         q_fix = ext_fix['q_fix']  # [x, y, z, w]
         self.q_fix = Rotation.from_quat(q_fix).as_matrix()
-
-
+        
     def build_work_plane(self):
         plane = self.params['work_plane']
         self.n_g = np.array(plane['n_g'], dtype=np.float64)
@@ -258,22 +289,10 @@ class CameraGalvoTransform:
             y_c = (pixel_y - self.K[1, 2]) / self.K[1, 1] * depth_m
             z_c = depth_m
             p_c_mm = np.array([x_c * 1000.0, y_c * 1000.0, z_c * 1000.0], dtype=np.float64)
-
-            # ptint("pixely1",pixel_y)
-            # x = x_c
-            # y = 0.0014499460 * x ** 2 + 0.0032976258 * x + 44.5000000000
-            # # delta_y = pixel_y - y
-            # y_c = y_c - y + 44.5
-            # print("pixel2", y_c)
-            # print("y",y)
-            # print("x",x)
-            # print("pixel_y",pixel_y)
-
             # print("p_c_mm:", p_c_mm)
             p_g = self.R_gc @ p_c_mm + self.t_gc
             # print("p_g:", p_g)
-            #todo
-            p_g = self.q_fix @ p_g + self.t_fix     #using fix extrinsics
+            p_g = self.q_fix @ p_g + self.t_fix
             return p_g
         except Exception:
             return None
@@ -307,6 +326,19 @@ class CameraGalvoTransform:
         except Exception:
             return None
 
+    def point_to_galvo_angles(self, point):
+        """ 从坐标点计算与振镜的夹角"""
+        x, y, z = point
+        self.reverse_theta_x = np.arctan2(x, z)
+        self.reverse_theta_y = np.arctan2(y, z)
+        if z < 0:
+            x, y, z = x, y, -z
+        if abs(z) < 1e-9:
+            return 0.0, 0.0
+        theta_x = np.arctan2(x, z)      #得到弧度
+        theta_y = np.arctan2(y, z)
+        # print("thetax,thetay:",theta_x, theta_y)
+        return theta_x, theta_y
 
     def angles_to_codes(self, theta_x, theta_y):
         """
@@ -318,28 +350,29 @@ class CameraGalvoTransform:
         # print("theta_x_deg,theta_y_deg ",theta_x_deg,theta_y_deg)
         theta_x_corrected = theta_x_deg * galvo['scale_x'] + galvo['bias_x']    #应用修正
         theta_y_corrected = theta_y_deg * galvo['scale_y'] + galvo['bias_y']
-        # print("theta_x_deg,theta_y_deg:", theta_x_corrected,theta_y_corrected)
+        print("theta_x_deg,theta_y_deg:", theta_x_corrected,theta_y_corrected)
 
-        # half_scan_angle = galvo['scan_angle'] / 2.0  # 一侧的最大旋转角度
+        half_scan_angle = galvo['scan_angle'] / 2.0  # 一侧的最大旋转角度
+
         # norm_x = theta_x_corrected / half_scan_angle
         # norm_y = theta_y_corrected / half_scan_angle
         # print("norm_x,norm_y:", norm_x, norm_y)
-        # code_x = theta_x_corrected / half_scan_angle * galvo['max_code'] #*91/89        #角度转成code值 todo
-        # if theta_y_corrected > 0:
-        #     code_y = theta_y_corrected / half_scan_angle * galvo['max_code'] #* 46.5 / 45.5
-        # else:
-        #     code_y = theta_y_corrected / half_scan_angle * galvo['max_code'] #*  44.5 / 45.5
 
         if theta_x_corrected >= 0:
-            code_x = theta_x_corrected / galvo['scan_angle_x_plus'] * 2.0 * galvo['max_code']
+            half_scan_angle = galvo['scan_angle_x_plus'] / 2.0
+            code_x = theta_x_corrected / half_scan_angle * galvo['max_code']
         elif theta_x_corrected < 0:
             half_scan_angle = galvo['scan_angle_x_minus'] / 2.0
             code_x = theta_x_corrected / half_scan_angle * galvo['max_code']
-        # print(theta_y_corrected)
         if theta_y_corrected >= 0:
-            code_y = theta_y_corrected / galvo['scan_angle_y_plus'] * 2.0 * galvo['max_code']
+            half_scan_angle = galvo['scan_angle_y_plus'] / 2.0
+            code_y = theta_y_corrected / half_scan_angle* galvo['max_code']
         elif theta_y_corrected < 0:
-            code_y = theta_y_corrected / galvo['scan_angle_y_minus'] * 2.0 * galvo['max_code']
+            half_scan_angle = galvo['scan_angle_y_minus'] / 2.0
+            code_y = theta_y_corrected / half_scan_angle * 2.0 * galvo['max_code']
+        # print(code_x, code_y)
+        # code_x = theta_x_corrected / half_scan_angle * galvo['max_code'] #角度转成code值
+        # code_y = theta_y_corrected / half_scan_angle * galvo['max_code']
 
         max_code = galvo['max_code']
         saturated = (abs(code_x) > max_code) or (abs(code_y) > max_code)
@@ -351,6 +384,38 @@ class CameraGalvoTransform:
 
         return code_x, code_y
 
+    @staticmethod
+    def _angles_yfirst_from_plane(X_mm, Y_mm, Z_mm):
+        # alpha 先（Y/Z），beta 后（X/Z * cos(alpha)）
+        Z = float(Z_mm)
+        alpha = np.arctan2(Y_mm, Z)
+        ca = np.cos(alpha)
+        beta = np.arctan2((X_mm / Z) * ca, 1.0)
+        return alpha, beta
+
+    def angles_to_codes_mech(self, alpha, beta):
+        # [alpha; beta] = [[kx, axy],[ayx, ky]] * ([cx-bx; cy-by])  的反解
+        p = self.galvo_lin
+        A11, A12 = p.kx, p.axy
+        A21, A22 = p.ayx, p.ky
+        det = A11 * A22 - A12 * A21
+        alpha = float(alpha)
+        beta = float(beta)
+
+        if abs(det) < 1e-16:
+            cx = p.bx + beta / (p.ayx if abs(p.ayx) > 1e-16 else -1e-5)
+            cy = p.by + alpha / (p.axy if abs(p.axy) > 1e-16 else -1e-5)
+        else:
+            dcx = (A22 * alpha - A12 * beta) / det
+            dcy = (-A21 * alpha + A11 * beta) / det
+            cx = p.bx + dcx
+            cy = p.by + dcy
+
+        cx = int(np.clip(np.rint(cx), -32767, 32767))
+        cy = int(np.clip(np.rint(cy), -32767, 32767))
+        return cx, cy
+
+
     def pixel_to_galvo_3d(self, pixel_x, pixel_y, image_width, image_height):
         try:
             # 优先使用深度
@@ -358,24 +423,21 @@ class CameraGalvoTransform:
                 depth_m = self.depth_query_func(pixel_x, pixel_y)
                 # print(depth_m)
                 if depth_m is not None and depth_m > 0:
+
                     # depth_m = 0.455 #0.455
                     point_g = self.pixel_depth_to_point_galvo(pixel_x, pixel_y, depth_m)
                     # print("pixel x,y,depth",pixel_x,pixel_y,depth_m)
-                    # print("point_g ",point_g)
                     if point_g is not None:
                         # 缓存命中点供反向映射使用
                         self.last_hit_point_g = point_g.copy()
 
-                        # theta_x, theta_y = self.point_to_galvo_angles(point_g)
-                        # code_x, code_y = self.angles_to_codes(theta_x, theta_y)
-                        self.use_mech_compensation = False
                         if self.use_mech_compensation:
                             theta_x, theta_y = self.point_to_galvo_angles_fix(point_g)
                             code_x, code_y = self.angles_to_codes(theta_x, theta_y)
-                            # code_x, code_y = self.angles_to_codes_mech(theta_y, theta_x)
                         else:
                             theta_x, theta_y = self.point_to_galvo_angles(point_g)
                             code_x, code_y = self.angles_to_codes(theta_x, theta_y)
+
                         self.last_pixel_pos = (pixel_x, pixel_y)
                         self.last_galvo_pos = (code_x, code_y)
                         # print("codex,codey",code_x,code_y)
@@ -415,76 +477,21 @@ class CameraGalvoTransform:
             x, y, z = x, y, -z
         if abs(z) < 1e-9:
             return 0.0, 0.0
-        #
-        # theta_x = np.arctan2(x, z)
-        # theta_y = np.arctan2(y * np.cos(theta_x), z)
 
-        d_mm = 20
-        #有振镜距离d_mm
         theta_x = np.arctan2(x, z)
-        # 2. 然后利用 theta_x, d 和 z 来计算 theta_y
-        cos_theta_x = np.cos(theta_x)
-        # 根据反解公式计算分子和分母
-        numerator_y = y * cos_theta_x
+        theta_y = np.arctan2(y * np.cos(theta_x), z)
+        return theta_x,theta_y
+        # d_mm = 20
+        # #有振镜距离d_mm
+        # theta_x = np.arctan2(x, z)
+        # # 2. 然后利用 theta_x, d 和 z 来计算 theta_y
+        # cos_theta_x = np.cos(theta_x)
+        # # 根据反解公式计算分子和分母
+        # numerator_y = y * cos_theta_x
         # denominator_y = z - d_mm * cos_theta_x
-
-        if numerator_y > 0:
-            denominator_y = z - d_mm * cos_theta_x
-        else:
-            denominator_y = z - d_mm * cos_theta_x
-        if abs(denominator_y) < 1e-9:
-            return theta_x, 0.0
-        theta_y = np.arctan2(numerator_y, denominator_y)
-
-
-        return theta_x, theta_y
-    def point_to_galvo_angles(self, point):
-        """ 从坐标点计算与振镜的夹角"""
-        x, y, z = point
-        self.reverse_theta_x = np.arctan2(x, z)
-        self.reverse_theta_y = np.arctan2(y, z)
-        if z < 0:
-            x, y, z = x, y, -z
-        if abs(z) < 1e-9:
-            return 0.0, 0.0
-        theta_x = np.arctan2(x, z)      #得到弧度
-        theta_y = np.arctan2(y, z)
-        # print("thetax,thetay:",theta_x, theta_y)
-        return theta_x, theta_y
-
-
-    @staticmethod
-    def _angles_yfirst_from_plane(X_mm, Y_mm, Z_mm):
-        # alpha 先（Y/Z），beta 后（X/Z * cos(alpha)）
-        Z = float(Z_mm)
-        if Z < 0:
-            X_mm, Y_mm, Z = X_mm, Y_mm, -Z
-        alpha = np.arctan2(Y_mm, Z)
-        ca = np.cos(alpha)
-        beta = np.arctan2((X_mm / Z) * ca, 1.0)
-        return alpha, beta
-
-    def angles_to_codes_mech(self, alpha, beta):
-        # [alpha; beta] = [[kx, axy],[ayx, ky]] * ([cx-bx; cy-by])  的反解
-        p = self.galvo_lin
-        A11, A12 = p.kx, p.axy
-        A21, A22 = p.ayx, p.ky
-        det = A11 * A22 - A12 * A21
-        alpha = float(alpha)
-        beta = float(beta)
-
-        if abs(det) < 1e-16:
-            cx = p.bx + beta / (p.ayx if abs(p.ayx) > 1e-16 else -1e-5)
-            cy = p.by + alpha / (p.axy if abs(p.axy) > 1e-16 else -1e-5)
-        else:
-            dcx = (A22 * alpha - A12 * beta) / det
-            dcy = (-A21 * alpha + A11 * beta) / det
-            cx = p.bx + dcx
-            cy = p.by + dcy
-
-        cx = int(np.clip(np.rint(cx), -32767, 32767))
-        cy = int(np.clip(np.rint(cy), -32767, 32767))
-        return cx, cy
+        # if abs(denominator_y) < 1e-9:
+        #     return theta_x, 0.0
+        # theta_y = np.arctan2(numerator_y, denominator_y)
 
     def pixel_to_galvo_simple(self, pixel_x, pixel_y, image_width, image_height):
         norm_x = (pixel_x / image_width - 0.5)
@@ -530,6 +537,15 @@ class CameraGalvoTransform:
 
         return theta_x, theta_y
 
+
+    def codes_to_angles_mech(self, cx, cy):
+        # 直接乘矩阵： [alpha; beta] = M * ([cx;cy] - [bx;by])
+        p = self.galvo_lin
+        v = np.array([float(cx) - p.bx, float(cy) - p.by], dtype=float)
+        M = np.array([[p.kx, p.axy],
+                      [p.ayx, p.ky]], dtype=float)
+        alpha, beta = (M @ v).tolist()
+        return alpha, beta
 
     def galvo_angles_to_point_on_plane(self, theta_x, theta_y):
         """
@@ -605,19 +621,12 @@ class CameraGalvoTransform:
         try:
             xg, yg, zg =  self.t_gc[0], self.t_gc[1], self.t_gc[2]
             t_cg = [xg, -yg, zg]
-            xfix,yfix,zfix =  self.t_fix[0], self.t_fix[1], self.t_fix[2]
-            t_fix = [xfix, -yfix, zfix]
-            # print("point_g1:",point_g)
-            # print("r fix,t fix",self.q_fix,t_fix)
-            point_g = self.q_fix.T @ point_g
-            point_g = point_g + t_fix
-            # print("point_g2:",point_g)
             # print("t_g:",self.t_gc)
+            camera_to_point = point_g #- self.t_gc
             # print("camera 2 point1",camera_to_point)
             # camera_to_point = camera_to_point / np.linalg.norm(camera_to_point)
-            p_gc = self.R_gc.T @ point_g  #from galvo corr to cam corr
+            p_gc = self.R_gc.T @ camera_to_point  #from galvo corr to cam corr
             p_gc  = p_gc + t_cg
-            # print("p_gc:",p_gc)
             return p_gc
         except Exception:
             return None
@@ -635,27 +644,20 @@ class CameraGalvoTransform:
             return (pixel_x, pixel_y)
         except Exception:
             return None
-    def codes_to_angles_mech(self, cx, cy):
-        # 直接乘矩阵： [alpha; beta] = M * ([cx;cy] - [bx;by])
-        p = self.galvo_lin
-        v = np.array([float(cx) - p.bx, float(cy) - p.by], dtype=float)
-        M = np.array([[p.kx, p.axy],
-                      [p.ayx, p.ky]], dtype=float)
-        alpha, beta = (M @ v).tolist()
-        return alpha, beta
+
     def galvo_code_to_pixel_3d(self, galvo_x, galvo_y, image_width, image_height):
         """
         code -> 角度 -> 交点-> pixel
         """
         try:
             # print("galvo x,y", galvo_x, galvo_y)
-            # theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
-            if self.use_mech_compensation:
-                alpha, beta = self.codes_to_angles_mech(galvo_x, galvo_y)
-                # 对应关系：alpha -> theta_y, beta -> theta_x
-                theta_y, theta_x = alpha, beta
-            else:
-                theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
+            # if self.use_mech_compensation:
+            #     alpha, beta = self.codes_to_angles_mech(galvo_x, galvo_y)
+            #     # 对应关系：alpha -> theta_y, beta -> theta_x
+            #     theta_y, theta_x = alpha, beta
+            # else:
+            theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
+
             # print("galvo 2 pixel thetax,y",theta_x,theta_y)
             max_code = self.params['galvo_params']['max_code']
             # if abs(galvo_x) >= max_code - 1 or abs(galvo_y) >= max_code - 1:
