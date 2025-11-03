@@ -849,34 +849,67 @@ class LaserWeedingNode:
             #         cv2.putText(result, "PRED", (int(predicted_pos[0] + 10), int(predicted_pos[1])),
             #                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-        # 绘制振镜激光实际瞄准位置
+        # 绘制所有振镜的激光瞄准位置
+        previous_profile = getattr(self.coordinate_transform, 'active_profile_index', None)
+        legend_entries = []
+        palette = [
+            (255, 170, 0),
+            (0, 170, 255),
+            (200, 200, 200),
+            (255, 0, 255)
+        ]
         try:    #最开始是因为没有读到深度,用的是给定的深度值,所以可视化中瞄准的不准确
-            active_pos = self.galvo_positions[self.active_galvo_index]
-            self.coordinate_transform.set_active_galvo_profile(self.active_galvo_index)
-            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
-                active_pos[0], active_pos[1],
-                self.image_width, self.image_height
-            )
+            for idx, active_pos in enumerate(self.galvo_positions):
+                if not isinstance(active_pos, (list, tuple)) or len(active_pos) < 2:
+                    continue
 
-            if galvo_pixel is not None:
-                color = (0, 0, 255) if self.laser_on else (255, 255, 0)
+                try:
+                    self.coordinate_transform.set_active_galvo_profile(idx)
+                    galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
+                        active_pos[0], active_pos[1],
+                        self.image_width, self.image_height
+                    )
+                except Exception as exc:
+                    rospy.logdebug(f"Failed reverse transform for galvo {idx}: {exc}")
+                    galvo_pixel = None
+
+                if galvo_pixel is None:
+                    legend_entries.append((f"G{idx}: 坐标未知", (0, 0, 255)))
+                    continue
+
                 xg = int(round(galvo_pixel[0]))
                 yg = int(round(galvo_pixel[1]))
 
-                cv2.line(result, (xg - 15, yg), (xg + 15, yg), color, 3)
-                cv2.line(result, (xg, yg - 15), (xg, yg + 15), color, 3)
-                cv2.circle(result, (xg, yg), 10, color, 2)
+                is_active = idx == self.active_galvo_index
+                if is_active and self.laser_on:
+                    color = (0, 0, 255)
+                    status = "LASER"
+                elif is_active:
+                    color = (0, 255, 255)
+                    status = "AIM"
+                else:
+                    color = palette[idx % len(palette)]
+                    status = "IDLE"
 
-                laser_status = "LASER ON" if self.laser_on else "AIM"
-                cv2.putText(result, laser_status, (xg + 20, yg - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                cross_half = 15 if is_active else 12
+                thickness = 3 if is_active else 2
+                cv2.line(result, (xg - cross_half, yg), (xg + cross_half, yg), color, thickness)
+                cv2.line(result, (xg, yg - cross_half), (xg, yg + cross_half), color, thickness)
+                cv2.circle(result, (xg, yg), cross_half - 5, color, 2)
+                cv2.putText(result, f"G{idx}", (xg + 12, yg - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                coord_text = f"({active_pos[0]:.0f},{active_pos[1]:.0f})"
-                pixel_text = f"{xg:.0f},{yg:.0f}"
-                cv2.putText(result, coord_text, (xg + 20, yg + 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-                cv2.putText(result, pixel_text, (xg + 20, yg + 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                legend_entries.append((
+                    f"G{idx} {status}: code({active_pos[0]:.0f},{active_pos[1]:.0f}) pix({xg},{yg})",
+                    color
+                ))
+
+            if legend_entries:
+                text_y = 150
+                for text, color in legend_entries:
+                    cv2.putText(result, text, (10, text_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    text_y += 24
             else:
                 cv2.putText(result, "GALVO POS UNKNOWN", (10, 150),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -885,6 +918,12 @@ class LaserWeedingNode:
             rospy.logdebug(f"Failed to draw galvo position: {e}")
             cv2.putText(result, "GALVO DISPLAY ERROR", (10, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        finally:
+            if previous_profile is not None:
+                try:
+                    self.coordinate_transform.set_active_galvo_profile(previous_profile)
+                except Exception:
+                    pass
 
         status_text = f"State: {self.system_state.value}"
         cv2.putText(result, status_text, (10, 30),

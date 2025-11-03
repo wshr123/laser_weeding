@@ -18,6 +18,7 @@
 - **按配置裁剪硬件数量**：根据 `CameraGalvoTransform` 返回的 profile 数量与 Teensy 实际支持数量计算 `galvo_count`，并将 `cam_params.yaml` 中的每头边界读入 `self.galvo_limits`，随后通过 `_configure_controller_limits` 主动下发到固件。【F:scripts/main.py†L92-L137】
 - **统一的限幅与范围判定**：新增 `clamp_to_galvo_limits`、`is_within_galvo_limits` 等工具，将预测轨迹、实时调度及状态发布均约束在各自限幅内；`in_galvo_scan_range`、`galvo_control_loop`、`update_position_history` 等流程都调用该逻辑，确保软硬件边界一致。【F:scripts/main.py†L485-L758】
 - **运行状态回传边界信息**：`publish_status` 增加 `galvo_limits` 字段，将每个振镜的 X/Y 码值范围发布到 ROS topic，便于上位机监控或调试配置。【F:scripts/main.py†L893-L927】
+- **多振镜瞄准可视化**：`draw_info` 遍历所有振镜位置，按激活/未激活状态绘制不同颜色的十字光标，并在图像上叠加每个振镜的码值与像素坐标，方便同时观察双振镜的瞄准位置。【F:scripts/main.py†L830-L909】
 
 ## 4. 标定工具
 - **单头偏移换算遵循限幅**：手动标定工具读取当前 profile 的 `galvo_params`、`max_code`、`code_scale` 与 `code_limits`，结合 `CameraGalvoTransform.get_axis_angle_limits(galvo_index)` 返回的正负扫描角，将码值偏移分轴按比例换算成角度并把最终结果写回 `manual_calibration.updated_galvo_params`，避免不同振镜共用相同上限。【F:scripts/galvo_calibrator.py†L653-L737】
@@ -30,6 +31,11 @@
 - **按头定义工作范围**：`galvos` 列表为左右振镜分别记录外参、`max_code` 与 `code_limits`，供坐标映射、上位机与固件限幅使用，避免两只振镜共享相同的最大扫描范围。【F:cam_params.yaml†L33-L66】
 - **每头独立角度参数**：每个 `galvos[].galvo_params` 保存独立的 `scan_angle`、各轴正负扫描角、比例因子与偏移；上位机按 profile 读取这些值进行角度与码值的正反转换。【F:cam_params.yaml†L41-L66】【F:scripts/coordinate_transform.py†L200-L321】
 - **保留全局默认值**：顶层 `galvo_params` 继续提供缺省角度字段，作为未显式配置振镜或新 profile 的兜底值。【F:cam_params.yaml†L21-L31】【F:scripts/coordinate_transform.py†L208-L273】
+
+## 6. 离线仿真回放
+
+- **ROS bag 图像回放节点**：新增 `bag_image_publisher.py`，可读取指定 bag 文件中的图像/CameraInfo 话题，按设定播放速率重放并刷新时间戳，支持循环播放，方便在无实机摄像头时复现流程。【F:scripts/bag_image_publisher.py†L1-L146】
+- **离线 Launch 配置**：`main_offline.launch` 改为启动新的 bag 回放节点，通过参数控制 bag 路径、输入输出话题与播放速率，实现以 bag 图像替代实时视频的离线仿真测试。【F:launch/main_offline.launch†L74-L90】
 
 以上改动共同实现了：
 1. 一块 Teensy 同时驱动两个振镜并共享激光控制，同时保证每个振镜的安全码值范围独立可调。

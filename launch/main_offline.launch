@@ -101,8 +101,14 @@
         <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
     </node>
 
-    <node pkg="rosbag" type="play" name="play_file2" output="screen"
-          args="-d 2 -r 0.8 --quiet /media/zhong/1.0T/harbin/20240809/5.2_harbin/miaojian/miaojian1.bag">
-      <remap from="/camera/image_raw" to="/camera/image_raw"/>
+    <node pkg="laser_weeding" type="bag_image_publisher.py" name="bag_image_publisher" output="screen">
+        <param name="bag_path" value="/media/zhong/1.0T/harbin/20240809/5.2_harbin/miaojian/miaojian1.bag" />
+        <param name="image_topic_in" value="/camera/image_raw" />
+        <param name="image_topic_out" value="/camera/image_raw" />
+        <param name="camera_info_topic_in" value="/camera/camera_info" />
+        <param name="camera_info_topic_out" value="/camera/camera_info" />
+        <param name="playback_rate" value="0.8" />
+        <param name="loop" value="false" />
+        <param name="update_header_stamp" value="true" />
     </node>
 </launch>
