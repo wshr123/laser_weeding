@@ -1,8 +1,22 @@
 // teensy_xy2_100_simple.ino
-// 简化版 Teensy 3.2 振镜控制器 - 使用XY2-100库
+// 简化版 Teensy 3.2 振镜控制器 - 使用XY2-100/XY2-100_multi库
 // 用于激光除草系统
 
+#if !defined(__has_include)
+#define __has_include(x) 0
+#endif
+
+#if __has_include(<XY2_100_multi.h>)
+#include <XY2_100_multi.h>
+using XY2Driver = XY2_100_multi;
+const char XY2_LIB_LABEL[] = "XY2-100_multi";
+#elif __has_include(<XY2_100.h>)
 #include <XY2_100.h>
+using XY2Driver = XY2_100;
+const char XY2_LIB_LABEL[] = "XY2-100";
+#else
+#error "No XY2-100 driver library found (expected XY2_100_multi or XY2_100)"
+#endif
 #include <math.h>
 
 // ===== 常量与类型 =====
@@ -14,9 +28,9 @@ enum LaserMode {
 };
 
 // ===== 创建XY2-100对象 =====
-XY2_100 galvo_primary;
-XY2_100 galvo_secondary;
-XY2_100* galvos[GALVO_COUNT] = {&galvo_primary, &galvo_secondary};
+XY2Driver galvo_primary;
+XY2Driver galvo_secondary;
+XY2Driver* galvos[GALVO_COUNT] = {&galvo_primary, &galvo_secondary};
 
 // ===== 激光控制引脚 =====
 const int LASER_PIN = 9;        // 激光TTL控制 (开/关)
@@ -111,7 +125,9 @@ void setup() {
   }
   
   Serial.println("=====================================");
-  Serial.println("  Simple XY2-100 Galvo Controller");
+  Serial.print("  Simple ");
+  Serial.print(XY2_LIB_LABEL);
+  Serial.println(" Galvo Controller");
   Serial.println("     Laser Weeding System v1.0");
   Serial.println("=====================================");
   
@@ -120,7 +136,9 @@ void setup() {
   digitalWrite(LASER_PIN, LOW);
   
   // 初始化XY2-100
-  Serial.println("Initializing XY2-100 protocol (dual head)...");
+  Serial.print("Initializing ");
+  Serial.print(XY2_LIB_LABEL);
+  Serial.println(" protocol (dual head)...");
   for (uint8_t i = 0; i < GALVO_COUNT; i++) {
     galvos[i]->begin();
     delay(100);
@@ -139,7 +157,8 @@ void setup() {
     last_keepalive_time[i] = micros();
   }
 
-  Serial.println("XY2-100 initialized");
+  Serial.print(XY2_LIB_LABEL);
+  Serial.println(" initialized");
   Serial.println("=====================================");
   Serial.println("Commands:");
   Serial.println("  GALVO:n    - Select galvo head (1-2)");
@@ -470,7 +489,7 @@ void parseCommand(String cmd) {
   }
   // 获取版本信息
   else if (cmd == "VERSION" || cmd == "VER") {
-    sendResponse("VERSION:1.1:XY2-100:TEENSY32:DUAL");
+    sendResponse(String("VERSION:1.1:") + XY2_LIB_LABEL + ":TEENSY32:DUAL");
   }
   // 画圆测试
   else if (cmd.startsWith("CIRCLE:")) {
