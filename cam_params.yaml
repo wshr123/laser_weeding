@@ -19,9 +19,36 @@ work_plane:
   d_g: -2560
 
 galvo_params:
-  scan_angle: 30.0   # 总扫描角度 (度)
+  scan_angle: 46.0   # 总扫描角度 (度)
+  scan_angle_x_plus: 45.4   # X轴正向最大角度 (度)
+  scan_angle_x_minus: 45.8  # X轴负向最大角度 (度)
+  scan_angle_y_plus: 47.4   # Y轴正向最大角度 (度)
+  scan_angle_y_minus: 45.8  # Y轴负向最大角度 (度)
   scale_x: 1.0       # X轴比例因子
   scale_y: 1.0       # Y轴比例因子
   bias_x: 0.0        # X轴零点偏移 (度)
   bias_y: 0.0        # Y轴零点偏移 (度)
   max_code: 32767    # 最大码值
+
+galvos:
+  - name: left_head
+    extrinsics:
+      t_gc_mm: [-120.0, 100.0, 0.0]
+      q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+    code_offset: [0.0, 0.0]
+    code_scale: [1.0, 1.0]
+    max_code: 31500
+    code_limits:
+      x: [-30500, 32000]
+      y: [-30000, 31000]
+
+  - name: right_head
+    extrinsics:
+      t_gc_mm: [120.0, 100.0, 0.0]
+      q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+    code_offset: [0.0, 0.0]
+    code_scale: [1.0, 1.0]
+    max_code: 32000
+    code_limits:
+      x: [-32000, 30500]
+      y: [-31000, 30000]

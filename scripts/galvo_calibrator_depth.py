@@ -18,7 +18,7 @@ import sys
 from scipy.spatial.transform import Rotation
 
 # 自有模块
-from coordinate_transform import CameraGalvoTransform
+from coordinate_transform import CameraGalvoTransform, resolve_config_path
 from send_to_teensy import XY2_100Controller
 
 
@@ -33,6 +33,10 @@ class ManualGalvoCalibrationNode:
 
         # ========== 参数 ==========
         self.load_parameters()
+
+        self.galvo_limits = ((-32767, 32767), (-32767, 32767))
+        self.galvo_min = -32767
+        self.galvo_max = 32767
 
         # 轴适配
         # self.swap_axes = rospy.get_param('~swap_axes', False)
@@ -52,21 +56,47 @@ class ManualGalvoCalibrationNode:
                 config_file=self.transform_config_file,
                 use_3d_transform=True
             )
+            self.coordinate_transform.set_active_galvo_profile(self.galvo_index)
             rospy.loginfo("3D coordinate transformer initialized")
         except Exception as e:
             rospy.logerr(f"Failed to initialize coordinate transformer: {e}")
             raise
 
+        try:
+            limits = self.coordinate_transform.get_code_limits(self.galvo_index)
+            self.galvo_limits = limits
+            (x_min, x_max), (y_min, y_max) = limits
+            self.galvo_min = min(x_min, y_min)
+            self.galvo_max = max(x_max, y_max)
+            rospy.loginfo(
+                f"Galvo {self.galvo_index} limits set to X[{x_min}, {x_max}] Y[{y_min}, {y_max}]"
+            )
+        except Exception as exc:
+            rospy.logwarn(f"Failed to read galvo limits from config: {exc}")
+
         # ========== 振镜控制 ==========
         try:
             self.galvo_controller = XY2_100Controller(
                 port=self.serial_port,
-                baudrate=self.serial_baudrate
+                baudrate=self.serial_baudrate,
+                galvo_count=self.galvo_index + 1
             )
+            try:
+                self.galvo_controller.select_galvo(self.galvo_index)
+            except Exception as exc:
+                rospy.logwarn(f"Failed to select galvo {self.galvo_index}: {exc}")
             rospy.loginfo("Galvo controller initialized")
         except Exception as e:
             rospy.logerr(f"Failed to initialize galvo controller: {e}")
             raise
+
+        try:
+            (x_min, x_max), (y_min, y_max) = self.galvo_limits
+            self.galvo_controller.configure_limits(
+                self.galvo_index, x_min, x_max, y_min, y_max
+            )
+        except Exception as exc:
+            rospy.logwarn(f"Failed to push galvo limits to controller: {exc}")
 
         # ========== 状态 ==========
         self.calibration_state = "IDLE"  # IDLE, CENTERING, SELECTING, MANUAL_AIMING
@@ -90,8 +120,6 @@ class ManualGalvoCalibrationNode:
         self._frame_index = 0
 
         # 振镜位置
-        self.galvo_min = -32767
-        self.galvo_max =  32767
         self.current_galvo_pos = [0, 0]
         self.target_galvo_pos  = [0, 0]
         self.manual_galvo_pos  = [0, 0]
@@ -196,7 +224,11 @@ class ManualGalvoCalibrationNode:
         self.serial_port = rospy.get_param('~serial_port', '/dev/ttyACM0')
         self.serial_baudrate = rospy.get_param('~serial_baudrate', 115200)
 
-        self.transform_config_file = rospy.get_param('~transform_config_file', 'cam_params.yaml')
+        config_param = rospy.get_param('~transform_config_file', 'cam_params.yaml')
+        self.transform_config_file = resolve_config_path(config_param)
+
+        self.galvo_index = int(rospy.get_param('~galvo_index', 0))
+        self.galvo_name = rospy.get_param('~galvo_name', f'galvo_{self.galvo_index}')
 
         self.image_width  = rospy.get_param('~image_width', 640)
         self.image_height = rospy.get_param('~image_height', 480)
@@ -272,7 +304,7 @@ class ManualGalvoCalibrationNode:
                 hx, hy = self._to_hw_axes(target_pos_logical[0], target_pos_logical[1])
 
                 if self.galvo_controller:
-                    self.galvo_controller.move_to_position(hx, hy)
+                    self.galvo_controller.move_to_position(hx, hy, galvo_index=self.galvo_index)
 
                 self.current_galvo_pos = target_pos_logical  # 记录当前“逻辑”位置
 
@@ -335,13 +367,16 @@ class ManualGalvoCalibrationNode:
             (50, self.image_height - 50, "Bottom-Left"),
         ]
         for px, py, label in corners:
-            code_hw = self.coordinate_transform.pixel_to_galvo_code(px, py, self.image_width, self.image_height)
+            code_hw = self.coordinate_transform.pixel_to_galvo_code(
+                px, py, self.image_width, self.image_height, galvo_index=self.galvo_index
+            )
             rospy.loginfo(f"{label}: Pixel({px}, {py}) -> Galvo(HW){code_hw}")
 
     # ===================== 基础工具 =====================
     def clamp_galvo_position(self, x, y):
-        x = max(self.galvo_min, min(self.galvo_max, int(x)))
-        y = max(self.galvo_min, min(self.galvo_max, int(y)))
+        (x_min, x_max), (y_min, y_max) = self.galvo_limits
+        x = max(x_min, min(x_max, int(x)))
+        y = max(y_min, min(y_max, int(y)))
         return [x, y]
 
 
@@ -536,7 +571,7 @@ class ManualGalvoCalibrationNode:
 
         pixel_x, pixel_y = self.current_target['center']
         code_hw = self.coordinate_transform.pixel_to_galvo_code(
-            pixel_x, pixel_y, self.image_width, self.image_height
+            pixel_x, pixel_y, self.image_width, self.image_height, galvo_index=self.galvo_index
         )
 
         if code_hw:
@@ -668,7 +703,7 @@ class ManualGalvoCalibrationNode:
         if self.current_target:
             pixel_x, pixel_y = self.current_target['center']
             code_hw = self.coordinate_transform.pixel_to_galvo_code(
-                pixel_x, pixel_y, self.image_width, self.image_height
+                pixel_x, pixel_y, self.image_width, self.image_height, galvo_index=self.galvo_index
             )
             if code_hw:
                 lx, ly = self._from_hw_axes(int(code_hw[0]), int(code_hw[1]))
@@ -775,23 +810,53 @@ class ManualGalvoCalibrationNode:
             rospy.logerr(f"计算三维变换时发生错误: {e}\n")
             return
 
-        calibration_result = {
-            'calibration_info': {
-                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'num_points_used': len(points_camera),
-                'method': '3D_rigid_body_transform_SVD'
+        calibration_info = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'num_points_used': len(points_camera),
+            'method': '3D_rigid_body_transform_SVD'
+        }
+        extrinsics = {
+            'description': '新的相机外参: 从相机坐标系到振镜坐标系的变换 (Pg = R * Pc + t)',
+            't_gc_mm': t.flatten().tolist(),
+            'R_gc': R.tolist(),
+            'q_gc_xyzw': Rotation.from_matrix(R).as_quat().tolist()
+        }
+
+        galvo_entry = {
+            'id': self.galvo_index,
+            'name': self.galvo_name,
+            'calibration_info': calibration_info,
+            'extrinsics': extrinsics,
+            'code_limits': {
+                'x': [int(self.galvo_limits[0][0]), int(self.galvo_limits[0][1])],
+                'y': [int(self.galvo_limits[1][0]), int(self.galvo_limits[1][1])]
             },
-            'extrinsics': {
-                'description': '新的相机外参: 从相机坐标系到振镜坐标系的变换 (Pg = R * Pc + t)',
-                't_gc_mm': t.flatten().tolist(),
-                'R_gc': R.tolist(),
-                'q_gc_xyzw': Rotation.from_matrix(R).as_quat().tolist()
-            }
+            'galvo_range': [int(self.galvo_min), int(self.galvo_max)]
         }
 
         try:
+            existing_data = {}
+            if os.path.exists(self.calibration_result_file):
+                with open(self.calibration_result_file, 'r') as f:
+                    existing_data = yaml.safe_load(f) or {}
+
+            galvos = existing_data.get('galvos', [])
+            updated = False
+            for entry in galvos:
+                if entry.get('id') == self.galvo_index or entry.get('name') == self.galvo_name:
+                    entry.update(galvo_entry)
+                    updated = True
+                    break
+
+            if not updated:
+                galvos.append(galvo_entry)
+
+            existing_data['galvos'] = galvos
+            existing_data['last_updated'] = calibration_info['timestamp']
+
             with open(self.calibration_result_file, 'w') as f:
-                yaml.dump(calibration_result, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+                yaml.dump(existing_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
             rospy.loginfo(f"新的三维标定结果已成功保存至: {self.calibration_result_file}\n")
         except Exception as e:
             rospy.logerr(f"保存标定文件失败: {e}\n")
@@ -935,8 +1000,10 @@ class ManualGalvoCalibrationNode:
         # 当前振镜位置
         try:
             hx, hy = self._to_hw_axes(self.current_galvo_pos[0], self.current_galvo_pos[1])
-            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(int(hx), int(hy),
-                                                                        self.image_width, self.image_height)
+            self.coordinate_transform.set_active_galvo_profile(self.galvo_index)
+            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
+                int(hx), int(hy), self.image_width, self.image_height
+            )
             # print("galvo_pixel",galvo_pixel)
             if galvo_pixel is not None:
                 x, y = int(round(galvo_pixel[0])), int(round(galvo_pixel[1]))
@@ -956,8 +1023,11 @@ class ManualGalvoCalibrationNode:
         if self.current_target:
             try:
                 px, py = self.current_target['center']
-                code_hw = self.coordinate_transform.pixel_to_galvo_code(px, py, self.image_width, self.image_height)
+                code_hw = self.coordinate_transform.pixel_to_galvo_code(
+                    px, py, self.image_width, self.image_height, galvo_index=self.galvo_index
+                )
                 if code_hw:
+                    self.coordinate_transform.set_active_galvo_profile(self.galvo_index)
                     ax, ay = self.coordinate_transform.galvo_code_to_pixel_3d(int(code_hw[0]), int(code_hw[1]),
                                                                            self.image_width, self.image_height)
                     ax, ay = int(round(ax)), int(round(ay))
@@ -979,9 +1049,15 @@ class ManualGalvoCalibrationNode:
                 'calibration_points': len(self.calibration_data),
                 'current_target_index': self.current_target_index,
                 'current_target': self.current_target['center'] if self.current_target else None,
+                'galvo_index': self.galvo_index,
+                'galvo_name': self.galvo_name,
                 'galvo_position_logical': self.current_galvo_pos,
                 'manual_galvo_position_logical': self.manual_galvo_pos,
                 'image_center_galvo_pos_logical': self.image_center_galvo_pos,
+                'code_limits': {
+                    'x': list(self.galvo_limits[0]),
+                    'y': list(self.galvo_limits[1])
+                },
                 'galvo_range': [self.galvo_min, self.galvo_max],
                 'laser_on': self.laser_on,
                 'step_size': self.fine_step if self.is_fine_mode else self.manual_step,
