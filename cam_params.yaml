@@ -41,6 +41,17 @@ galvos:
     code_limits:
       x: [-30500, 32000]
       y: [-30000, 31000]
+    galvo_params:
+      scan_angle: 46.0
+      scan_angle_x_plus: 45.4
+      scan_angle_x_minus: 45.8
+      scan_angle_y_plus: 47.4
+      scan_angle_y_minus: 45.8
+      scale_x: 1.0
+      scale_y: 1.0
+      bias_x: 0.0
+      bias_y: 0.0
+      max_code: 31500
 
   - name: right_head
     extrinsics:
@@ -52,3 +63,14 @@ galvos:
     code_limits:
       x: [-32000, 30500]
       y: [-31000, 30000]
+    galvo_params:
+      scan_angle: 45.0
+      scan_angle_x_plus: 44.6
+      scan_angle_x_minus: 45.2
+      scan_angle_y_plus: 46.1
+      scan_angle_y_minus: 44.8
+      scale_x: 1.0
+      scale_y: 1.0
+      bias_x: 0.0
+      bias_y: 0.0
+      max_code: 32000

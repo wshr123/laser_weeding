@@ -653,9 +653,9 @@ class ManualGalvoCalibrationNode:
     def galvo_offset_to_angle_offset(self, galvo_offset_x, galvo_offset_y):
         """将振镜码值偏移转换为角度偏移（度）"""
         try:
-            galvo_params = self.coordinate_transform.params['galvo_params']
+            galvo_params = self.coordinate_transform.get_galvo_params(self.galvo_index)
             profile_info = self.coordinate_transform.get_profile_metadata(self.galvo_index)
-            max_code = float(profile_info.get('max_code', galvo_params['max_code']))  # 每个振镜单独的最大码值
+            max_code = float(profile_info.get('max_code', galvo_params.get('max_code', 32767)))  # 每个振镜单独的最大码值
             code_scale = profile_info.get('code_scale', [1.0, 1.0]) or [1.0, 1.0]
             scale_x = float(code_scale[0]) if abs(code_scale[0]) > 1e-9 else 1.0
             scale_y = float(code_scale[1]) if abs(code_scale[1]) > 1e-9 else 1.0
@@ -663,7 +663,7 @@ class ManualGalvoCalibrationNode:
             base_offset_x = galvo_offset_x / scale_x
             base_offset_y = galvo_offset_y / scale_y
 
-            axis_limits = self.coordinate_transform.get_axis_angle_limits()
+            axis_limits = self.coordinate_transform.get_axis_angle_limits(self.galvo_index)
             x_plus = float(axis_limits.get('x_plus', galvo_params.get('scan_angle', 0.0) / 2.0))
             x_minus = float(axis_limits.get('x_minus', galvo_params.get('scan_angle', 0.0) / 2.0))
             y_plus = float(axis_limits.get('y_plus', galvo_params.get('scan_angle', 0.0) / 2.0))
@@ -718,7 +718,7 @@ class ManualGalvoCalibrationNode:
             'rms_error': float(np.sqrt(np.mean(np.sum(angle_offsets ** 2, axis=1))))
         }
 
-        updated_galvo_params = dict(self.coordinate_transform.params['galvo_params'])
+        updated_galvo_params = dict(self.coordinate_transform.get_galvo_params(self.galvo_index))
         updated_galvo_params['bias_x'] = bias_x
         updated_galvo_params['bias_y'] = bias_y
         updated_galvo_params['max_code'] = float(

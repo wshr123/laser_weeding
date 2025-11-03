@@ -53,6 +53,8 @@ class GalvoHeadProfile:
     code_scale: np.ndarray
     max_code: float
     code_limits: np.ndarray
+    galvo_params: Dict[str, float]
+    axis_angle_limits: Dict[str, float]
 
 
 class CameraGalvoTransform:
@@ -149,6 +151,7 @@ class CameraGalvoTransform:
         self.active_profile_max_code: float = float(self.params['galvo_params'].get('max_code', 32767))
         self.active_profile_scale = np.ones(2, dtype=np.float64)
         self.active_profile_offset = np.zeros(2, dtype=np.float64)
+        self.active_galvo_params: Dict[str, float] = dict(self.params.get('galvo_params', {}))
         self._load_galvo_profiles()
         self.set_active_galvo_profile(0)
 
@@ -215,8 +218,8 @@ class CameraGalvoTransform:
             else:
                 default_dict[key] = value
 
-    def _update_axis_angle_limits(self) -> None:
-        galvo = self.params.get('galvo_params', {})
+    def _compute_axis_angle_limits(self, galvo_params: Dict[str, object]) -> Dict[str, float]:
+        galvo = galvo_params or {}
         default_total = galvo.get('scan_angle', self.default_params['galvo_params']['scan_angle'])
         try:
             default_half = float(default_total) / 2.0
@@ -246,17 +249,33 @@ class CameraGalvoTransform:
 
             return numeric
 
-        self.axis_angle_limits = {
+        return {
             'x_plus': resolve('scan_angle_x_plus', 'scan_angle_x_plus'),
             'x_minus': resolve('scan_angle_x_minus', 'scan_angle_x_minus'),
             'y_plus': resolve('scan_angle_y_plus', 'scan_angle_y_plus'),
             'y_minus': resolve('scan_angle_y_minus', 'scan_angle_y_minus'),
         }
 
-    def get_axis_angle_limits(self) -> Dict[str, float]:
-        """Return the cached galvo scan angle limits (degrees)."""
+    def _update_axis_angle_limits(self) -> None:
+        self.axis_angle_limits = self._compute_axis_angle_limits(self.params.get('galvo_params', {}))
 
-        return dict(self.axis_angle_limits)
+    def get_axis_angle_limits(self, index: Optional[int] = None) -> Dict[str, float]:
+        """Return the galvo scan angle limits (degrees)."""
+
+        if index is None:
+            return dict(self.axis_angle_limits)
+
+        profile = self._get_profile(index)
+        return dict(profile.axis_angle_limits)
+
+    def get_galvo_params(self, index: Optional[int] = None) -> Dict[str, float]:
+        """Return the galvo parameter dictionary for the requested head."""
+
+        if index is None:
+            return dict(self.active_galvo_params)
+
+        profile = self._get_profile(index)
+        return dict(profile.galvo_params)
 
     def enable_mech_compensation(self, enabled: bool):
         self.use_mech_compensation = bool(enabled)
@@ -297,7 +316,9 @@ class CameraGalvoTransform:
                 code_limits=np.array([
                     [-default_max_code, default_max_code],
                     [-default_max_code, default_max_code]
-                ], dtype=np.float64)
+                ], dtype=np.float64),
+                galvo_params=dict(self.params.get('galvo_params', {})),
+                axis_angle_limits=self._compute_axis_angle_limits(self.params.get('galvo_params', {}))
             )
             self._galvo_profiles.append(profile)
             return
@@ -333,7 +354,22 @@ class CameraGalvoTransform:
                 dtype=np.float64
             )
 
-            profile_max_code = float(entry.get('max_code', default_max_code))
+            entry_params = entry.get('galvo_params', {}) or {}
+            # allow direct shorthand fields inside the galvo entry
+            for key in ('scan_angle', 'scan_angle_x_plus', 'scan_angle_x_minus',
+                        'scan_angle_y_plus', 'scan_angle_y_minus',
+                        'scale_x', 'scale_y', 'bias_x', 'bias_y', 'max_code'):
+                if key in entry and key not in entry_params:
+                    entry_params[key] = entry[key]
+
+            profile_galvo_params = dict(self.params.get('galvo_params', {}))
+            for key, value in entry_params.items():
+                try:
+                    profile_galvo_params[key] = float(value)
+                except (TypeError, ValueError):
+                    profile_galvo_params[key] = value
+
+            profile_max_code = float(profile_galvo_params.get('max_code', entry.get('max_code', default_max_code)))
             limits_entry = entry.get('code_limits', {}) or {}
             if isinstance(limits_entry, dict):
                 x_limits = limits_entry.get('x', [-profile_max_code, profile_max_code])
@@ -349,6 +385,8 @@ class CameraGalvoTransform:
                 [float(y_limits[0]), float(y_limits[1])]
             ], dtype=np.float64)
 
+            profile_axis_limits = self._compute_axis_angle_limits(profile_galvo_params)
+
             profile = GalvoHeadProfile(
                 index=idx,
                 name=name,
@@ -358,9 +396,15 @@ class CameraGalvoTransform:
                 code_offset=code_offset,
                 code_scale=code_scale,
                 max_code=profile_max_code,
-                code_limits=code_limits
+                code_limits=code_limits,
+                galvo_params=profile_galvo_params,
+                axis_angle_limits=profile_axis_limits
             )
             self._galvo_profiles.append(profile)
+            try:
+                self.params.setdefault('galvos', [])[idx]['galvo_params'] = dict(profile_galvo_params)
+            except Exception:
+                pass
 
     def set_active_galvo_profile(self, index: int):
         if not self._galvo_profiles:
@@ -381,6 +425,8 @@ class CameraGalvoTransform:
         self.active_profile_max_code = float(profile.max_code)
         self.active_profile_scale = np.array(profile.code_scale, dtype=np.float64)
         self.active_profile_offset = np.array(profile.code_offset, dtype=np.float64)
+        self.active_galvo_params = dict(profile.galvo_params)
+        self.axis_angle_limits = dict(profile.axis_angle_limits)
 
     def _get_profile(self, index: int) -> GalvoHeadProfile:
         if not self._galvo_profiles:
@@ -416,7 +462,9 @@ class CameraGalvoTransform:
             'code_offset': profile.code_offset.tolist(),
             'code_scale': profile.code_scale.tolist(),
             'code_limits': profile.code_limits.tolist(),
-            'max_code': profile.max_code
+            'max_code': profile.max_code,
+            'galvo_params': dict(profile.galvo_params),
+            'axis_angle_limits': dict(profile.axis_angle_limits)
         }
 
     def list_galvo_profiles(self) -> List[Dict[str, object]]:
@@ -631,7 +679,7 @@ class CameraGalvoTransform:
         """
         角度转成振镜编码，xy2-100形式
         """
-        galvo = self.params['galvo_params']
+        galvo = self.active_galvo_params
         profile = self._get_profile(self.active_profile_index)
         theta_x_deg = np.degrees(theta_x)   #弧度转角度
         theta_y_deg = np.degrees(theta_y)
@@ -776,7 +824,7 @@ class CameraGalvoTransform:
 
     def codes_to_angles(self, code_x, code_y):
 
-        galvo = self.params['galvo_params']
+        galvo = self.active_galvo_params
         profile = self._get_profile(self.active_profile_index)
 
         scale_x = profile.code_scale[0] if profile.code_scale[0] != 0 else 1.0
@@ -928,7 +976,7 @@ class CameraGalvoTransform:
                 theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
 
             # print("galvo 2 pixel thetax,y",theta_x,theta_y)
-            max_code = self.params['galvo_params']['max_code']
+            max_code = self.active_profile_max_code
             # if abs(galvo_x) >= max_code - 1 or abs(galvo_y) >= max_code - 1:
             #     rospy.logwarn_throttle(1.0, "galvo_code appears saturated; reverse projection may be inaccurate")
 
@@ -1012,7 +1060,7 @@ class CameraGalvoTransform:
             'transform_method': self.transform_method_used,
             'use_3d_transform': self.use_3d_transform,
             'transform_fail_count': getattr(self, 'transform_fail_count', 0),
-            'galvo_params': self.params['galvo_params'],
+            'galvo_params': self.active_galvo_params,
             'simple_mapping': self.params['simple_mapping'],
             'fixed_reverse_depth_z_mm': self.fixed_reverse_depth_z_mm,
             'active_galvo_profile': self.get_profile_metadata(self.active_profile_index),

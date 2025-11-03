@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 
+import copy
 import cv2
 import numpy as np
 import rospy
@@ -912,9 +913,17 @@ class ManualGalvoCalibrationNode:
 
     def generate_updated_config(self, calibration_result):
         try:
-            original_config = self.coordinate_transform.params.copy()
-            original_config['galvo_params']['bias_x'] = calibration_result['angle_bias']['bias_x']
-            original_config['galvo_params']['bias_y'] = calibration_result['angle_bias']['bias_y']
+            original_config = copy.deepcopy(self.coordinate_transform.params)
+            angle_bias = calibration_result['angle_bias']
+
+            galvo_entries = original_config.get('galvos', []) or []
+            if 0 <= self.galvo_index < len(galvo_entries):
+                target_params = galvo_entries[self.galvo_index].setdefault('galvo_params', {})
+            else:
+                target_params = original_config.setdefault('galvo_params', {})
+
+            target_params['bias_x'] = angle_bias['bias_x']
+            target_params['bias_y'] = angle_bias['bias_y']
             base_name = os.path.splitext(self.calibration_result_file)[0]
             updated_config_file = f"{base_name}_updated_config.yaml"
             with open(updated_config_file, 'w') as f:
