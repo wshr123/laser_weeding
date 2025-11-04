@@ -74,3 +74,12 @@ galvos:
       bias_x: 0.0
       bias_y: 0.0
       max_code: 32000
+
+manual_calibration:
+  enabled: true                      # 启用手工标定结果自动加载
+  result_file: manual_galvo_calibration.yaml  # 标定输出文件（相对仓库根目录或绝对路径）
+  apply_extrinsics: true             # 使用手工标定的外参覆盖配置中的值
+  apply_bias: true                   # 使用手工标定的偏置/比例更新 galvo_params
+  apply_code_limits: true            # 如有需要，更新码值范围
+  match_by_name: true                # 通过 name 优先匹配振镜
+  fallback_to_id: true               # 如 name 未匹配，则按 id 匹配

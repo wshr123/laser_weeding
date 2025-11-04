@@ -8,6 +8,7 @@ import cv2
 from onnx.reference.ops.op_non_max_suppression import PrepareContext
 from scipy.spatial.transform import Rotation
 import os
+import copy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -75,6 +76,7 @@ class CameraGalvoTransform:
 
         self.config_file_path = resolved_config_file
         self.use_3d_transform = use_3d_transform
+        self.manual_calibration_report: Optional[Dict[str, object]] = None
 
         self.default_params = {
             'transform_mode': {
@@ -190,7 +192,7 @@ class CameraGalvoTransform:
     # -------------------- 参数与初始化 --------------------
 
     def load_config(self, config_file):
-        self.params = self.default_params.copy()
+        self.params = copy.deepcopy(self.default_params)
 
         if config_file and os.path.exists(config_file):
             try:
@@ -217,6 +219,7 @@ class CameraGalvoTransform:
         else:
             rospy.loginfo("Using default configuration parameters")
 
+        self._apply_manual_calibration_overrides()
         self._update_axis_angle_limits()
 
     def _refresh_base_extrinsics_from_params(self) -> None:
@@ -260,6 +263,197 @@ class CameraGalvoTransform:
                 self.update_params_recursive(default_dict[key], value)
             else:
                 default_dict[key] = value
+
+    def _apply_manual_calibration_overrides(self) -> None:
+        manual_cfg = self.params.get('manual_calibration', {}) or {}
+        report = {
+            'enabled': bool(manual_cfg.get('enabled', False)),
+            'applied': False,
+            'path': None,
+            'profiles': [],
+            'load_error': None,
+        }
+        self.manual_calibration_report = report
+
+        if not report['enabled']:
+            return
+
+        manual_file = manual_cfg.get('result_file') or manual_cfg.get('file')
+        if not manual_file:
+            rospy.logwarn_once("Manual calibration enabled but no result_file provided")
+            report['load_error'] = 'missing result_file'
+            return
+
+        manual_path = resolve_config_path(manual_file)
+        report['path'] = manual_path
+
+        if not os.path.exists(manual_path):
+            rospy.logwarn_once(f"Manual calibration file {manual_path} does not exist")
+            report['load_error'] = 'file_not_found'
+            return
+
+        try:
+            with open(manual_path, 'r') as f:
+                manual_data = yaml.safe_load(f) or {}
+        except Exception as exc:
+            rospy.logwarn(f"Failed to load manual calibration file {manual_path}: {exc}")
+            report['load_error'] = str(exc)
+            return
+
+        report['source'] = manual_data
+
+        apply_extrinsics = bool(manual_cfg.get('apply_extrinsics', True))
+        apply_bias = bool(manual_cfg.get('apply_bias', True))
+        apply_limits = bool(manual_cfg.get('apply_code_limits', True))
+        match_by_name = bool(manual_cfg.get('match_by_name', True))
+        fallback_to_id = bool(manual_cfg.get('fallback_to_id', True))
+
+        galvo_entries = self.params.get('galvos')
+        if not isinstance(galvo_entries, list):
+            galvo_entries = []
+            self.params['galvos'] = galvo_entries
+
+        manual_galvos = manual_data.get('galvos', []) if isinstance(manual_data, dict) else []
+        if not manual_galvos:
+            rospy.logwarn_once(f"Manual calibration file {manual_path} does not contain galvo entries")
+            report['load_error'] = 'no_galvo_entries'
+            return
+
+        for entry in manual_galvos:
+            if not isinstance(entry, dict):
+                continue
+
+            entry_name = entry.get('name')
+            entry_id = entry.get('id')
+            target_index = None
+            target_entry = None
+
+            if match_by_name and entry_name:
+                for idx, existing in enumerate(galvo_entries):
+                    if isinstance(existing, dict) and existing.get('name') == entry_name:
+                        target_index = idx
+                        target_entry = existing
+                        break
+
+            if target_entry is None and fallback_to_id and entry_id is not None:
+                try:
+                    candidate = int(entry_id)
+                except (TypeError, ValueError):
+                    candidate = None
+                if candidate is not None and 0 <= candidate < len(galvo_entries):
+                    target_index = candidate
+                    target_entry = galvo_entries[candidate]
+
+            if target_entry is None:
+                galvo_entries.append({})
+                target_index = len(galvo_entries) - 1
+                target_entry = galvo_entries[target_index]
+                if entry_name:
+                    target_entry['name'] = entry_name
+
+            extr_applied = False
+            bias_applied = False
+            limit_applied = False
+
+            if apply_extrinsics and isinstance(entry.get('extrinsics'), dict):
+                extr_source = entry['extrinsics']
+                extr_target = target_entry.setdefault('extrinsics', {})
+
+                if 't_gc_mm' in extr_source:
+                    extr_target['t_gc_mm'] = [float(v) for v in extr_source['t_gc_mm']]
+                    extr_applied = True
+                elif 't_gc' in extr_source:
+                    extr_target['t_gc_mm'] = [float(v) for v in extr_source['t_gc']]
+                    extr_applied = True
+
+                if 'R_gc' in extr_source:
+                    extr_target['R_gc'] = [[float(value) for value in row] for row in extr_source['R_gc']]
+                    extr_applied = True
+
+                if 'q_gc_xyzw' in extr_source:
+                    extr_target['q_gc_xyzw'] = [float(v) for v in extr_source['q_gc_xyzw']]
+                    extr_applied = True
+                elif 'q_gc' in extr_source:
+                    extr_target['q_gc'] = [float(v) for v in extr_source['q_gc']]
+                    extr_applied = True
+
+            if apply_bias:
+                manual_info = entry.get('manual_calibration')
+                target_params = target_entry.setdefault('galvo_params', {})
+
+                if isinstance(manual_info, dict):
+                    angle_bias = manual_info.get('angle_bias', {}) or {}
+                    for axis_key in ('bias_x', 'bias_y'):
+                        if axis_key in angle_bias:
+                            try:
+                                target_params[axis_key] = float(angle_bias[axis_key])
+                            except (TypeError, ValueError):
+                                target_params[axis_key] = angle_bias[axis_key]
+                            bias_applied = True
+
+                    updated_params = manual_info.get('updated_galvo_params', {}) or {}
+                    for key, value in updated_params.items():
+                        if value is None:
+                            continue
+                        try:
+                            target_params[key] = float(value)
+                        except (TypeError, ValueError):
+                            target_params[key] = value
+                        bias_applied = True
+
+                angle_bias_entry = entry.get('angle_bias') or {}
+                if isinstance(angle_bias_entry, dict):
+                    for axis_key in ('bias_x', 'bias_y'):
+                        if axis_key in angle_bias_entry:
+                            try:
+                                target_params[axis_key] = float(angle_bias_entry[axis_key])
+                            except (TypeError, ValueError):
+                                target_params[axis_key] = angle_bias_entry[axis_key]
+                            bias_applied = True
+
+            if apply_limits and isinstance(entry.get('code_limits'), dict):
+                target_entry['code_limits'] = entry['code_limits']
+                limit_applied = True
+
+            profile_summary = {
+                'index': target_index,
+                'name': target_entry.get('name', f'galvo_{target_index}'),
+                'applied_extrinsics': extr_applied,
+                'applied_bias': bias_applied,
+                'applied_limits': limit_applied,
+            }
+
+            validation = entry.get('validation')
+            if isinstance(validation, dict):
+                profile_summary['validation'] = {
+                    'rmse_total_mm': validation.get('rmse_total_mm'),
+                    'max_error_mm': validation.get('max_error_mm'),
+                    'mean_error_mm': validation.get('mean_error_mm'),
+                }
+
+                rmse_val = validation.get('rmse_total_mm')
+                max_val = validation.get('max_error_mm')
+                if rmse_val is not None and max_val is not None:
+                    try:
+                        rospy.loginfo(
+                            f"Manual calibration residuals for {profile_summary['name']}: "
+                            f"RMSE={float(rmse_val):.2f} mm, Max={float(max_val):.2f} mm"
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+            report['profiles'].append(profile_summary)
+
+            if extr_applied or bias_applied or limit_applied:
+                report['applied'] = True
+                rospy.loginfo(
+                    f"Applied manual calibration overrides to galvo '{profile_summary['name']}' (index {target_index})"
+                )
+
+        if not report['applied']:
+            rospy.logwarn_once(
+                f"Manual calibration file {manual_path} did not apply any overrides."
+            )
 
     def _compute_axis_angle_limits(self, galvo_params: Dict[str, object]) -> Dict[str, float]:
         galvo = galvo_params or {}
@@ -512,6 +706,12 @@ class CameraGalvoTransform:
 
     def list_galvo_profiles(self) -> List[Dict[str, object]]:
         return [self.get_profile_metadata(idx) for idx in range(len(self._galvo_profiles))]
+
+    def get_manual_calibration_report(self) -> Dict[str, object]:
+        if self.manual_calibration_report is None:
+            return {}
+
+        return copy.deepcopy(self.manual_calibration_report)
 
     def _apply_profile_adjustments(self, codes, profile: Optional[GalvoHeadProfile]):
         if profile is None:

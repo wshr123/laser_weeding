@@ -811,10 +811,31 @@ class ManualGalvoCalibrationNode:
             rospy.logerr(f"计算三维变换时发生错误: {e}\n")
             return
 
+        transformed_points = (R @ points_camera_np.T + t).T
+        residuals = points_galvo_np - transformed_points
+        per_point_error = np.linalg.norm(residuals, axis=1)
+        axis_rmse = np.sqrt(np.mean(residuals ** 2, axis=0))
+        rmse_total = float(np.sqrt(np.mean(np.sum(residuals ** 2, axis=1))))
+        max_error = float(np.max(per_point_error))
+        mean_error = float(np.mean(per_point_error))
+
+        rospy.loginfo(
+            "标定残差统计 (mm): "
+            f"RMSE_total={rmse_total:.3f}, max={max_error:.3f}, mean={mean_error:.3f}, "
+            f"axis_rmse=[{axis_rmse[0]:.3f}, {axis_rmse[1]:.3f}, {axis_rmse[2]:.3f}]\n"
+        )
+
         calibration_info = {
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
             'num_points_used': len(points_camera),
-            'method': '3D_rigid_body_transform_SVD'
+            'method': '3D_rigid_body_transform_SVD',
+            'validation': {
+                'rmse_total_mm': rmse_total,
+                'max_error_mm': max_error,
+                'mean_error_mm': mean_error,
+                'rmse_axis_mm': [float(axis_rmse[0]), float(axis_rmse[1]), float(axis_rmse[2])],
+                'samples': len(points_camera)
+            }
         }
         extrinsics = {
             'description': '新的相机外参: 从相机坐标系到振镜坐标系的变换 (Pg = R * Pc + t)',
@@ -823,11 +844,22 @@ class ManualGalvoCalibrationNode:
             'q_gc_xyzw': Rotation.from_matrix(R).as_quat().tolist()
         }
 
+        validation_metrics = {
+            'rmse_axis_mm': [float(axis_rmse[0]), float(axis_rmse[1]), float(axis_rmse[2])],
+            'rmse_total_mm': rmse_total,
+            'max_error_mm': max_error,
+            'mean_error_mm': mean_error,
+            'per_point_error_mm': per_point_error.tolist(),
+            'residuals_mm': residuals.tolist(),
+            'samples': len(points_camera)
+        }
+
         galvo_entry = {
             'id': self.galvo_index,
             'name': self.galvo_name,
             'calibration_info': calibration_info,
             'extrinsics': extrinsics,
+            'validation': validation_metrics,
             'code_limits': {
                 'x': [int(self.galvo_limits[0][0]), int(self.galvo_limits[0][1])],
                 'y': [int(self.galvo_limits[1][0]), int(self.galvo_limits[1][1])]

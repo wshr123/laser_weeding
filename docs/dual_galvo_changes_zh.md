@@ -13,6 +13,7 @@
 - **统一的限幅/元数据接口**：提供 `get_galvo_profile_count`、`get_code_limits`、`get_profile_metadata` 与 `list_galvo_profiles`，供上位机和标定工具检索每个振镜的独立边界与补偿参数；`get_transform_info` 会回传激活 profile 的角度/码值信息。【F:scripts/coordinate_transform.py†L337-L374】【F:scripts/coordinate_transform.py†L839-L855】
 - **角度/码值双向转换带 Profile**：`angles_to_codes` 与 `codes_to_angles` 在计算后引用各自 profile 的缩放、偏移、`max_code` 与角度限值，保证正反向转换都受配置文件约束，与保存在控制器/固件中的上限一致。【F:scripts/coordinate_transform.py†L632-L807】
 - **非对称扫描角映射**：`_compute_axis_angle_limits` 支持每个振镜独立的 `scan_angle_x_plus` / `scan_angle_x_minus` / `scan_angle_y_plus` / `scan_angle_y_minus`，并在 profile 切换时更新缓存，使不同方向的最大角度都能正确换算成码值并参与限幅。【F:scripts/coordinate_transform.py†L208-L273】【F:scripts/coordinate_transform.py†L614-L807】
+- **手工标定覆盖与报告**：读取 `cam_params.yaml` 中新增的 `manual_calibration` 配置后，会解析 `manual_galvo_calibration.yaml`，按振镜名称或编号套用手工标定的外参、偏置与码值范围，并记录残差统计供运行时检查。【F:cam_params.yaml†L78-L85】【F:scripts/coordinate_transform.py†L194-L223】【F:scripts/coordinate_transform.py†L267-L455】
 
 ## 3. 主控制节点 `scripts/main.py`
 - **按配置裁剪硬件数量**：根据 `CameraGalvoTransform` 返回的 profile 数量与 Teensy 实际支持数量计算 `galvo_count`，并将 `cam_params.yaml` 中的每头边界读入 `self.galvo_limits`，随后通过 `_configure_controller_limits` 主动下发到固件。【F:scripts/main.py†L92-L137】
@@ -24,6 +25,7 @@
 ## 4. 标定工具
 - **单头偏移换算遵循限幅**：手动标定工具读取当前 profile 的 `galvo_params`、`max_code`、`code_scale` 与 `code_limits`，结合 `CameraGalvoTransform.get_axis_angle_limits(galvo_index)` 返回的正负扫描角，将码值偏移分轴按比例换算成角度并把最终结果写回 `manual_calibration.updated_galvo_params`，避免不同振镜共用相同上限。【F:scripts/galvo_calibrator.py†L653-L737】
 - **三维标定写回独立参数**：`galvo_calibrator_depth.py` 生成更新配置时会深拷贝当前参数，并仅修改目标振镜的 `galvo_params.bias_x/bias_y`，确保多振镜独立角度与偏移不会互相覆盖。【F:scripts/galvo_calibrator_depth.py†L912-L925】
+- **自动计算残差验证标定精度**：三维标定完成后立即把相机点云变换到振镜系，与实测点做差并输出 RMSE/最大误差，同时把每个样本的残差、均方统计写入结果文件，方便后续加载时核对精度。【F:scripts/galvo_calibrator_depth.py†L768-L868】
 
 ## 5. 位机串口控制 `scripts/send_to_teensy.py`
 - **上位机缓存限幅并推送固件**：控制器维护 `self.galvo_limits`，在 `move_to_position` 前先做本地限幅，`configure_limits` 则向固件发送 `LIMITS` 命令并同步缓存，确保上下位机对安全范围认知一致。【F:scripts/send_to_teensy.py†L29-L137】【F:scripts/send_to_teensy.py†L218-L247】
