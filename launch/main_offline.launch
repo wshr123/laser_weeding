@@ -60,7 +60,7 @@
     <node pkg="laser_weeding" type="main.py" name="laser_weeding_node" output="screen" required="true">
         <!-- 模型参数 -->
         <param name="model_type" value="yolov11" />
-        <param name="model_path" value="/home/zhong/runs/detect/fake_intra/weights/best.pt" />
+        <param name="model_path" value="/media/zhong/ORICO/fake_intra.pt" />
         <param name="device" value="0" />
         <param name="tracker_type" value="bytetrack" />
 
@@ -103,7 +103,7 @@
     </node>
 
     <node pkg="laser_weeding" type="bag_image_publisher.py" name="bag_image_publisher" output="screen">
-        <param name="bag_path" value="/media/zhong/1.0T/harbin/20240809/5.2_harbin/miaojian/miaojian1.bag" />
+        <param name="bag_path" value="/media/zhong/ORICO/laser_weeding/miaojian1.bag" />
         <param name="image_topic_in" value="/camera/image_raw" />
         <param name="image_topic_out" value="/camera/image_raw" />
         <param name="camera_info_topic_in" value="/camera/camera_info" />
