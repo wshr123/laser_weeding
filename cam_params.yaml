@@ -19,9 +19,72 @@ work_plane:
   d_g: -2560
 
 galvo_params:
-  scan_angle: 30.0   # 总扫描角度 (度)
+  scan_angle: 46.0   # 总扫描角度 (度)
+  scan_angle_x_plus: 45.4   # X轴正向最大角度 (度)
+  scan_angle_x_minus: 45.8  # X轴负向最大角度 (度)
+  scan_angle_y_plus: 47.4   # Y轴正向最大角度 (度)
+  scan_angle_y_minus: 45.8  # Y轴负向最大角度 (度)
   scale_x: 1.0       # X轴比例因子
   scale_y: 1.0       # Y轴比例因子
   bias_x: 0.0        # X轴零点偏移 (度)
   bias_y: 0.0        # Y轴零点偏移 (度)
   max_code: 32767    # 最大码值
+
+galvos:
+  - name: left_head
+    extrinsics:
+      rough:
+        t_gc_mm: [-120.0, 100.0, 0.0]
+        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      refined:
+        t_gc_mm: [-122.5, 102.0, 1.5]
+        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      active: refined
+    code_offset: [0.0, 0.0]
+    code_scale: [1.0, 1.0]
+    max_code: 31500
+    code_limits:
+      x: [-30500, 32000]
+      y: [-30000, 31000]
+    galvo_params:
+      scan_angle: 46.0
+      scan_angle_x_plus: 45.4
+      scan_angle_x_minus: 45.8
+      scan_angle_y_plus: 47.4
+      scan_angle_y_minus: 45.8
+      scale_x: 1.0
+      scale_y: 1.0
+      bias_x: 0.0
+      bias_y: 0.0
+      max_code: 31500
+
+  - name: right_head
+    extrinsics:
+      rough:
+        t_gc_mm: [120.0, 100.0, 0.0]
+        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      refined:
+        t_gc_mm: [118.7, 99.5, -1.2]
+        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      active: refined
+    code_offset: [0.0, 0.0]
+    code_scale: [1.0, 1.0]
+    max_code: 32000
+    code_limits:
+      x: [-32000, 30500]
+      y: [-31000, 30000]
+    galvo_params:
+      scan_angle: 45.0
+      scan_angle_x_plus: 44.6
+      scan_angle_x_minus: 45.2
+      scan_angle_y_plus: 46.1
+      scan_angle_y_minus: 44.8
+      scale_x: 1.0
+      scale_y: 1.0
+      bias_x: 0.0
+      bias_y: 0.0
+      max_code: 32000
+
+manual_calibration:
+  enabled: true                      # 启用手工标定结果自动加载
+  result_file: manual_galvo_calibration.yaml  # 标定输出文件

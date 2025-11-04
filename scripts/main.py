@@ -16,10 +16,11 @@ import time
 from collections import deque
 from enum import Enum
 import threading
+from typing import Dict, List, Tuple
 
 # 导入振镜控制器和新的坐标变换模块
 from send_to_teensy import XY2_100Controller
-from coordinate_transform import CameraGalvoTransform
+from coordinate_transform import CameraGalvoTransform, resolve_config_path
 
 
 class SystemState(Enum):
@@ -42,13 +43,16 @@ class LaserWeedingNode:
 
             # ========== 坐标变换模式选择 ==========
             use_3d_transform = rospy.get_param('~use_3d_transform', True)
-            config_file = rospy.get_param('~transform_config_file', None)
+            self.use_reverse_projection = rospy.get_param('~use_reverse_projection', True)
+            config_param = rospy.get_param('~transform_config_file', None)
+            config_file = resolve_config_path(config_param)
 
             try:
                 self.coordinate_transform = CameraGalvoTransform(
                     config_file=config_file,
                     use_3d_transform=use_3d_transform
                 )
+                rospy.loginfo(f"using transform config: {self.coordinate_transform.config_file_path}")
             except Exception as e:
                 rospy.logerr(f"failed initialize coordinate transform: {e}")
                 sys.exit(1)
@@ -75,8 +79,11 @@ class LaserWeedingNode:
             self.serial_port = rospy.get_param('~serial_port', '/dev/ttyACM0')
             self.serial_baudrate = rospy.get_param('~serial_baudrate', 115200)
             self.min_move_step = rospy.get_param('~min_move_step', 2)
-            self.galvo_min = -32767
-            self.galvo_max = 32767
+            profile_count = max(1, self.coordinate_transform.get_galvo_profile_count())
+            self.requested_galvo_count = int(rospy.get_param('~galvo_count', profile_count))
+            self.galvo_split_axis = rospy.get_param('~galvo_split_axis', 'vertical').lower()
+            self.galvo_split_ratio = float(rospy.get_param('~galvo_split_ratio', 0.5))
+            self.galvo_overlap_px = int(rospy.get_param('~galvo_overlap_px', 40))
 
             # 图像参数
             self.image_width = rospy.get_param('~image_width', 640)
@@ -90,12 +97,46 @@ class LaserWeedingNode:
             try:
                 self.galvo_controller = XY2_100Controller(
                     port=self.serial_port,
-                    baudrate=self.serial_baudrate
+                    baudrate=self.serial_baudrate,
+                    galvo_count=max(1, self.requested_galvo_count)
                 )
                 rospy.loginfo(f"initializing galvo controller : {self.serial_port}")
             except Exception as e:
                 rospy.logwarn(f": initializing galvo controller {e}")
                 self.galvo_controller = None
+
+            controller_count = getattr(
+                self.galvo_controller,
+                'galvo_count',
+                max(1, self.requested_galvo_count)
+            )
+            requested_count = max(1, self.requested_galvo_count)
+
+            if controller_count < profile_count:
+                rospy.logwarn(
+                    f"galvo controller supports {controller_count} heads but {profile_count} profiles are available"
+                )
+            if profile_count < requested_count:
+                rospy.logwarn(
+                    f"only {profile_count} galvo profiles found, adjusting requested count {requested_count}"
+                )
+
+            self.galvo_count = max(1, min(controller_count, profile_count, requested_count))
+            if self.galvo_controller and self.galvo_controller.galvo_count != self.galvo_count:
+                rospy.loginfo(
+                    f"using {self.galvo_count} galvo heads for scheduling (controller reports {controller_count})"
+                )
+
+            self.galvo_limits = []
+            for idx in range(self.galvo_count):
+                try:
+                    limits = self.coordinate_transform.get_code_limits(idx)
+                except Exception as exc:
+                    rospy.logwarn(f"failed to read galvo limits for head {idx}: {exc}")
+                    limits = ((-32767, 32767), (-32767, 32767))
+                self.galvo_limits.append(limits)
+
+            self._configure_controller_limits()
 
             # ========== 检测器初始化 ==========
             try:
@@ -131,8 +172,12 @@ class LaserWeedingNode:
             self.last_update_time = time.time()
 
             # 振镜控制
-            self.galvo_position = [0, 0]
-            self.target_galvo_position = [0, 0]
+            self.active_galvo_index = 0
+            self.galvo_positions = [[0, 0] for _ in range(self.galvo_count)]
+            self.target_galvo_positions = [[0, 0] for _ in range(self.galvo_count)]
+            self.galvo_pixel_targets = [[None, None] for _ in range(self.galvo_count)]
+            self.galvo_regions = []
+            self._update_galvo_regions()
             self.laser_on = False
             self.tracking_active = False
 
@@ -235,6 +280,7 @@ class LaserWeedingNode:
                 self.image_width = w
                 self.image_height = h
                 rospy.loginfo(f"update image size: {w}x{h}")
+                self._update_galvo_regions()
 
             # FPS计算
             current_time = time.time()
@@ -284,7 +330,7 @@ class LaserWeedingNode:
                     if info.get('stable_frames', 0) < self.min_stable_frames:
                         continue
                     # 在扫描范围内才作为候选
-                    if not self.in_galvo_scan_range(info['center'][0], info['center'][1]):
+                    if not info.get('in_range', False):
                         continue
 
                     dist = np.hypot(info['center'][0] - cx, info['center'][1] - cy)
@@ -298,15 +344,28 @@ class LaserWeedingNode:
                 if self.target_queue:
                     target_id = self.target_queue.pop(0)
                     if target_id in self.all_targets and target_id not in self.processed_targets:
+                        target_info = self.all_targets[target_id]
+                        galvo_index = target_info.get('galvo_index', 0)
                         self.current_target = {
                             'id': target_id,
-                            'start_time': current_time
+                            'start_time': current_time,
+                            'galvo_index': galvo_index
                         }
                         self.processing_target = target_id
                         self.position_history.clear()
 
+                        self.active_galvo_index = galvo_index
+                        if self.galvo_controller:
+                            try:
+                                self.galvo_controller.select_galvo(galvo_index)
+                            except Exception as exc:
+                                rospy.logdebug(f"failed to select galvo {galvo_index}: {exc}")
+
+                        with self.position_lock:
+                            self.target_galvo_positions[galvo_index] = self.galvo_positions[galvo_index][:]
+
                         if self.use_kalman and self.kalman_filter:
-                            center = self.all_targets[target_id]['center']
+                            center = target_info['center']
                             self.kalman_filter.statePre = np.array(
                                 [[center[0]], [center[1]], [0], [0]],
                                 dtype=np.float32
@@ -326,7 +385,8 @@ class LaserWeedingNode:
 
                     if target_id in self.all_targets:
                         target_info = self.all_targets[target_id]
-                        self.update_position_history(target_info['center'], current_time)
+                        galvo_index = target_info.get('galvo_index', self.active_galvo_index)
+                        self.update_position_history(target_info['center'], current_time, galvo_index)
 
                         elapsed = current_time - self.current_target['start_time']
                         if elapsed >= self.aiming_time:
@@ -342,7 +402,8 @@ class LaserWeedingNode:
 
                     if target_id in self.all_targets:
                         target_info = self.all_targets[target_id]
-                        self.update_position_history(target_info['center'], current_time)
+                        galvo_index = target_info.get('galvo_index', self.active_galvo_index)
+                        self.update_position_history(target_info['center'], current_time, galvo_index)
 
                     elapsed = current_time - self.state_start_time
                     if elapsed >= self.laser_time:
@@ -389,16 +450,131 @@ class LaserWeedingNode:
                 return None
             return z
 
+    def _update_galvo_regions(self):
+        if self.galvo_count <= 1:
+            self.galvo_regions = [{
+                'u_min': 0,
+                'u_max': self.image_width,
+                'v_min': 0,
+                'v_max': self.image_height
+            }]
+            return
+
+        if self.galvo_count > 2:
+            rospy.logwarn_once("Current implementation supports at most two galvo regions; extra heads will share the last region")
+
+        width = max(1, int(self.image_width))
+        height = max(1, int(self.image_height))
+        overlap = max(0, int(self.galvo_overlap_px))
+
+        if self.galvo_split_axis == 'horizontal':
+            split = int(round(height * self.galvo_split_ratio))
+            split = max(0, min(height, split))
+            top_max = min(height, split + overlap // 2)
+            bottom_min = max(0, split - overlap // 2)
+            self.galvo_regions = [
+                {'u_min': 0, 'u_max': width, 'v_min': 0, 'v_max': max(0, top_max)},
+                {'u_min': 0, 'u_max': width, 'v_min': min(height, bottom_min), 'v_max': height}
+            ]
+        else:
+            split = int(round(width * self.galvo_split_ratio))
+            split = max(0, min(width, split))
+            left_max = min(width, split + overlap // 2)
+            right_min = max(0, split - overlap // 2)
+            self.galvo_regions = [
+                {'u_min': 0, 'u_max': max(0, left_max), 'v_min': 0, 'v_max': height},
+                {'u_min': min(width, right_min), 'u_max': width, 'v_min': 0, 'v_max': height}
+            ]
+
+    def _configure_controller_limits(self):
+        if not self.galvo_controller or not self.galvo_controller.is_connected():
+            return
+
+        for idx, limits in enumerate(self.galvo_limits):
+            if not limits:
+                continue
+            (x_min, x_max), (y_min, y_max) = limits
+            try:
+                self.galvo_controller.configure_limits(
+                    idx,
+                    int(x_min),
+                    int(x_max),
+                    int(y_min),
+                    int(y_max)
+                )
+            except Exception as exc:
+                rospy.logwarn(f"failed to push galvo limits for head {idx}: {exc}")
+
+    def get_galvo_limits(self, galvo_index: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+        if 0 <= galvo_index < len(self.galvo_limits):
+            return self.galvo_limits[galvo_index]
+        return ((-32767, 32767), (-32767, 32767))
+
+    def is_within_galvo_limits(self, galvo_index: int, x: float, y: float) -> bool:
+        (x_min, x_max), (y_min, y_max) = self.get_galvo_limits(galvo_index)
+        return x_min <= x <= x_max and y_min <= y <= y_max
+
+    def clamp_to_galvo_limits(self, galvo_index: int, x: float, y: float) -> Tuple[int, int]:
+        (x_min, x_max), (y_min, y_max) = self.get_galvo_limits(galvo_index)
+        clamped_x = int(max(x_min, min(x_max, int(round(x)))))
+        clamped_y = int(max(y_min, min(y_max, int(round(y)))))
+        return clamped_x, clamped_y
+
+    def select_galvo_for_pixel(self, u: float, v: float) -> int:
+        if not self.galvo_regions:
+            return 0
+
+        candidates = []
+        fallback = []
+        for idx, region in enumerate(self.galvo_regions):
+            in_region = (
+                region['u_min'] <= u <= region['u_max'] and
+                region['v_min'] <= v <= region['v_max']
+            )
+            center_u = (region['u_min'] + region['u_max']) / 2.0
+            center_v = (region['v_min'] + region['v_max']) / 2.0
+            center_dist = (u - center_u) ** 2 + (v - center_v) ** 2
+
+            if in_region:
+                candidates.append((center_dist, idx))
+                continue
+
+            du = 0.0
+            if u < region['u_min']:
+                du = region['u_min'] - u
+            elif u > region['u_max']:
+                du = u - region['u_max']
+
+            dv = 0.0
+            if v < region['v_min']:
+                dv = region['v_min'] - v
+            elif v > region['v_max']:
+                dv = v - region['v_max']
+
+            fallback.append((du * du + dv * dv, idx, center_dist))
+
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1]
+
+        if fallback:
+            fallback.sort(key=lambda item: (item[0], item[2]))
+            return fallback[0][1]
+
+        return 0
+
     def in_galvo_scan_range(self, u, v):
         """判断像素点是否在振镜扫描范围内：用几何模型映射到码值并检查范围"""
         try:
+            galvo_index = self.select_galvo_for_pixel(float(u), float(v))
             code = self.coordinate_transform.pixel_to_galvo_code(
-                float(u), float(v), self.image_width, self.image_height
+                float(u), float(v), self.image_width, self.image_height,
+                galvo_index=galvo_index
             )
             if code is None:
                 return False
             x, y = int(code[0]), int(code[1])
-            return (self.galvo_min <= x <= self.galvo_max) and (self.galvo_min <= y <= self.galvo_max)
+            return self.is_within_galvo_limits(galvo_index, x, y)
         except Exception:
             return False
 
@@ -444,11 +620,15 @@ class LaserWeedingNode:
                 }
 
             # 已处理的目标更新基础信息后继续标记 processed
+            galvo_index = self.select_galvo_for_pixel(cx, cy)
+            in_range = self.in_galvo_scan_range(cx, cy)
             self.all_targets[track_id].update({
                 'bbox': bbox,
                 'center': [cx, cy],
                 'confidence': confidence,
                 'last_seen': current_time,
+                'galvo_index': galvo_index,
+                'in_range': in_range
             })
 
             if track_id in self.processed_targets:
@@ -479,47 +659,58 @@ class LaserWeedingNode:
                 except ValueError:
                     pass
 
-    def update_position_history(self, position, timestamp):
+    def update_position_history(self, position, timestamp, galvo_index):
         """更新位置历史并计算预测位置"""
         self.position_history.append({
             'position': position,
-            'time': timestamp
+            'time': timestamp,
+            'galvo': galvo_index
         })
 
-        predicted_pos = self.predict_position(self.prediction_time)
+        predicted_pos = self.predict_position(self.prediction_time, galvo_index)
 
         if predicted_pos:
-            # 检查预测距离是否合理
             current_pos = position
             distance = np.hypot(predicted_pos[0] - current_pos[0],
                                 predicted_pos[1] - current_pos[1])
 
             if distance > self.max_prediction_distance:
                 predicted_pos = current_pos
-            # 使用坐标变换
-            galvo_result = self.coordinate_transform.pixel_to_galvo_code(
-                predicted_pos[0], predicted_pos[1],
-                self.image_width, self.image_height
-            )
 
-            if galvo_result:
-                galvo_x, galvo_y = galvo_result
+            if predicted_pos:
+                clamped_px = float(np.clip(predicted_pos[0], 0, self.image_width - 1))
+                clamped_py = float(np.clip(predicted_pos[1], 0, self.image_height - 1))
                 with self.position_lock:
-                    self.target_galvo_position = [galvo_x, galvo_y]
+                    self.galvo_pixel_targets[galvo_index] = [clamped_px, clamped_py]
 
-    def predict_position(self, dt):
+                galvo_result = self.coordinate_transform.pixel_to_galvo_code(
+                    predicted_pos[0], predicted_pos[1],
+                    self.image_width, self.image_height,
+                    galvo_index=galvo_index
+                )
+
+                if galvo_result:
+                    galvo_x, galvo_y = self.clamp_to_galvo_limits(galvo_index, galvo_result[0], galvo_result[1])
+                    with self.position_lock:
+                        self.target_galvo_positions[galvo_index] = [galvo_x, galvo_y]
+                        self.active_galvo_index = galvo_index
+
+    def predict_position(self, dt, galvo_index):
         """预测未来位置"""
-        if len(self.position_history) < 2:
-            return self.position_history[-1]['position'] if self.position_history else None
+        relevant_history = [
+            entry for entry in self.position_history if entry.get('galvo') == galvo_index
+        ]
 
-        # 使用卡尔曼滤波
+        if len(relevant_history) < 2:
+            return relevant_history[-1]['position'] if relevant_history else None
+
         if self.use_kalman and self.kalman_filter:
             try:
-                current_pos = self.position_history[-1]['position']
+                current_pos = relevant_history[-1]['position']
                 measurement = np.array([[current_pos[0]], [current_pos[1]]], dtype=np.float32)
 
                 self.kalman_filter.correct(measurement)
-                prediction = self.kalman_filter.predict()
+                self.kalman_filter.predict()
 
                 state = self.kalman_filter.statePost
                 pred_x = state[0, 0] + state[2, 0] * dt
@@ -529,10 +720,9 @@ class LaserWeedingNode:
             except Exception as e:
                 rospy.logdebug(f"kalman predict failed: {e}")
 
-        # 简单线性预测
-        if len(self.position_history) >= 2:
-            p1 = self.position_history[-2]
-            p2 = self.position_history[-1]
+        if len(relevant_history) >= 2:
+            p1 = relevant_history[-2]
+            p2 = relevant_history[-1]
 
             time_diff = p2['time'] - p1['time']
             if time_diff > 0:
@@ -544,7 +734,7 @@ class LaserWeedingNode:
 
                 return [pred_x, pred_y]
 
-        return self.position_history[-1]['position']
+        return relevant_history[-1]['position']
 
     def galvo_control_loop(self):
         """振镜控制线程（高频率）"""
@@ -553,25 +743,30 @@ class LaserWeedingNode:
         while self.running and not rospy.is_shutdown():
             try:
                 with self.position_lock:
-                    target_pos = self.target_galvo_position.copy()
+                    target_positions = [pos[:] for pos in self.target_galvo_positions]
 
-                dx = target_pos[0] - self.galvo_position[0]
-                dy = target_pos[1] - self.galvo_position[1]
-                distance = np.hypot(dx, dy)
-                if distance > self.min_move_step:
-                    if self.galvo_controller:
+                for idx, target_pos in enumerate(target_positions):
+                    current_pos = self.galvo_positions[idx]
+                    dx = target_pos[0] - current_pos[0]
+                    dy = target_pos[1] - current_pos[1]
+                    distance = np.hypot(dx, dy)
+
+                    cmd_x, cmd_y = self.clamp_to_galvo_limits(idx, target_pos[0], target_pos[1])
+                    if distance > self.min_move_step and self.galvo_controller:
                         self.galvo_controller.move_to_position(
-                            int(target_pos[0]),
-                            int(target_pos[1])
+                            cmd_x,
+                            cmd_y,
+                            galvo_index=idx
                         )
 
-                    self.galvo_position = target_pos
+                    self.galvo_positions[idx] = [cmd_x, cmd_y]
 
                     galvo_msg = Int32MultiArray()
                     galvo_msg.data = [
-                        int(target_pos[0]),
-                        int(target_pos[1]),
-                        1 if self.laser_on else 0
+                        cmd_x,
+                        cmd_y,
+                        1 if (self.laser_on and idx == self.active_galvo_index) else 0,
+                        idx
                     ]
                     self.galvo_pub.publish(galvo_msg)
 
@@ -609,6 +804,7 @@ class LaserWeedingNode:
             if self.galvo_controller:
                 try:
                     if enable:
+                        self.galvo_controller.select_galvo(self.active_galvo_index)
                         self.galvo_controller.send_command("LASER:ON")
                     else:
                         self.galvo_controller.send_command("LASER:OFF")
@@ -661,32 +857,76 @@ class LaserWeedingNode:
             #         cv2.putText(result, "PRED", (int(predicted_pos[0] + 10), int(predicted_pos[1])),
             #                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-        # 绘制振镜激光实际瞄准位置
+        # 绘制所有振镜的激光瞄准位置
+        previous_profile = getattr(self.coordinate_transform, 'active_profile_index', None) if self.coordinate_transform else None
+        legend_entries = []
+        palette = [
+            (255, 170, 0),
+            (0, 170, 255),
+            (200, 200, 200),
+            (255, 0, 255)
+        ]
         try:    #最开始是因为没有读到深度,用的是给定的深度值,所以可视化中瞄准的不准确
-            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
-                self.galvo_position[0], self.galvo_position[1],
-                self.image_width, self.image_height
-            )
+            for idx, active_pos in enumerate(self.galvo_positions):
+                if not isinstance(active_pos, (list, tuple)) or len(active_pos) < 2:
+                    continue
 
-            if galvo_pixel is not None:
-                color = (0, 0, 255) if self.laser_on else (255, 255, 0)
+                galvo_pixel = None
+
+                if self.coordinate_transform and self.use_reverse_projection:
+                    try:
+                        self.coordinate_transform.set_active_galvo_profile(idx)
+                        galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
+                            active_pos[0], active_pos[1],
+                            self.image_width, self.image_height
+                        )
+                    except Exception as exc:
+                        rospy.logdebug(f"Failed reverse transform for galvo {idx}: {exc}")
+                        galvo_pixel = None
+
+                if galvo_pixel is None:
+                    with self.position_lock:
+                        pixel_target = self.galvo_pixel_targets[idx][:] if self.galvo_pixel_targets[idx] else None
+                    if pixel_target and pixel_target[0] is not None and pixel_target[1] is not None:
+                        galvo_pixel = pixel_target
+
+                if galvo_pixel is None:
+                    legend_entries.append((f"G{idx}: 坐标未知", (0, 0, 255)))
+                    continue
+
                 xg = int(round(galvo_pixel[0]))
                 yg = int(round(galvo_pixel[1]))
 
-                cv2.line(result, (xg - 15, yg), (xg + 15, yg), color, 3)
-                cv2.line(result, (xg, yg - 15), (xg, yg + 15), color, 3)
-                cv2.circle(result, (xg, yg), 10, color, 2)
+                is_active = idx == self.active_galvo_index
+                if is_active and self.laser_on:
+                    color = (0, 0, 255)
+                    status = "LASER"
+                elif is_active:
+                    color = (0, 255, 255)
+                    status = "AIM"
+                else:
+                    color = palette[idx % len(palette)]
+                    status = "IDLE"
 
-                laser_status = "LASER ON" if self.laser_on else "AIM"
-                cv2.putText(result, laser_status, (xg + 20, yg - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                cross_half = 15 if is_active else 12
+                thickness = 3 if is_active else 2
+                cv2.line(result, (xg - cross_half, yg), (xg + cross_half, yg), color, thickness)
+                cv2.line(result, (xg, yg - cross_half), (xg, yg + cross_half), color, thickness)
+                cv2.circle(result, (xg, yg), cross_half - 5, color, 2)
+                cv2.putText(result, f"G{idx}", (xg + 12, yg - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                coord_text = f"({self.galvo_position[0]:.0f},{self.galvo_position[1]:.0f})"
-                pixel_text = f"{xg:.0f},{yg:.0f}"
-                cv2.putText(result, coord_text, (xg + 20, yg + 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-                cv2.putText(result, pixel_text, (xg + 20, yg + 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                legend_entries.append((
+                    f"G{idx} {status}: code({active_pos[0]:.0f},{active_pos[1]:.0f}) pix({xg},{yg})",
+                    color
+                ))
+
+            if legend_entries:
+                text_y = 150
+                for text, color in legend_entries:
+                    cv2.putText(result, text, (10, text_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    text_y += 24
             else:
                 cv2.putText(result, "GALVO POS UNKNOWN", (10, 150),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
@@ -695,6 +935,12 @@ class LaserWeedingNode:
             rospy.logdebug(f"Failed to draw galvo position: {e}")
             cv2.putText(result, "GALVO DISPLAY ERROR", (10, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        finally:
+            if previous_profile is not None and self.coordinate_transform:
+                try:
+                    self.coordinate_transform.set_active_galvo_profile(previous_profile)
+                except Exception:
+                    pass
 
         status_text = f"State: {self.system_state.value}"
         cv2.putText(result, status_text, (10, 30),
@@ -721,7 +967,17 @@ class LaserWeedingNode:
                 'total_targets': len(self.all_targets),
                 'laser_on': self.laser_on,
                 'fps': round(fps, 1),
-                'galvo_position': self.galvo_position,
+                'galvo_position': self.galvo_positions[self.active_galvo_index],
+                'galvo_positions': self.galvo_positions,
+                'active_galvo': self.active_galvo_index,
+                'galvo_limits': [
+                    {
+                        'x': [int(lim[0][0]), int(lim[0][1])],
+                        'y': [int(lim[1][0]), int(lim[1][1])]
+                    }
+                    for lim in self.galvo_limits
+                ],
+                'galvo_regions': self.galvo_regions,
                 'prediction_time_ms': self.prediction_time * 1000,
                 'total_delay_ms': self.total_delay * 1000,
                 'transform_info': transform_info,
@@ -738,11 +994,13 @@ class LaserWeedingNode:
 
             if self.current_target and self.current_target['id'] in self.all_targets:
                 target_info = self.all_targets[self.current_target['id']]
+                assigned_galvo = target_info.get('galvo_index', self.active_galvo_index)
                 target_data = {
                     'id': self.current_target['id'],
                     'center': target_info['center'],
                     'confidence': target_info['confidence'],
-                    'predicted_position': self.predict_position(self.prediction_time)
+                    'galvo_index': assigned_galvo,
+                    'predicted_position': self.predict_position(self.prediction_time, assigned_galvo)
                 }
                 target_msg = String()
                 target_msg.data = json.dumps(target_data)

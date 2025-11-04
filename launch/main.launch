@@ -37,7 +37,7 @@
         <param name="max_prediction_distance" value="200" />
 
         <!-- 激光控制 -->
-        <param name="aiming_time" value="5000" />
+        <param name="aiming_time" value="0.1" />
         <param name="laser_time" value="0.4" />
 
         <!-- 振镜参数 -->
@@ -58,7 +58,7 @@
 
         <!-- 坐标变换模式 -->
         <param name="use_3d_transform" value="true" />
-        <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
+        <param name="transform_config_file" value="$(find laser_weeding)/cam_params.yaml" />
 
     </node>
 </launch>
