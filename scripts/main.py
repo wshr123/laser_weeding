@@ -43,6 +43,7 @@ class LaserWeedingNode:
 
             # ========== 坐标变换模式选择 ==========
             use_3d_transform = rospy.get_param('~use_3d_transform', True)
+            self.use_reverse_projection = rospy.get_param('~use_reverse_projection', True)
             config_param = rospy.get_param('~transform_config_file', None)
             config_file = resolve_config_path(config_param)
 
@@ -174,6 +175,7 @@ class LaserWeedingNode:
             self.active_galvo_index = 0
             self.galvo_positions = [[0, 0] for _ in range(self.galvo_count)]
             self.target_galvo_positions = [[0, 0] for _ in range(self.galvo_count)]
+            self.galvo_pixel_targets = [[None, None] for _ in range(self.galvo_count)]
             self.galvo_regions = []
             self._update_galvo_regions()
             self.laser_on = False
@@ -675,17 +677,23 @@ class LaserWeedingNode:
             if distance > self.max_prediction_distance:
                 predicted_pos = current_pos
 
-            galvo_result = self.coordinate_transform.pixel_to_galvo_code(
-                predicted_pos[0], predicted_pos[1],
-                self.image_width, self.image_height,
-                galvo_index=galvo_index
-            )
-
-            if galvo_result:
-                galvo_x, galvo_y = self.clamp_to_galvo_limits(galvo_index, galvo_result[0], galvo_result[1])
+            if predicted_pos:
+                clamped_px = float(np.clip(predicted_pos[0], 0, self.image_width - 1))
+                clamped_py = float(np.clip(predicted_pos[1], 0, self.image_height - 1))
                 with self.position_lock:
-                    self.target_galvo_positions[galvo_index] = [galvo_x, galvo_y]
-                    self.active_galvo_index = galvo_index
+                    self.galvo_pixel_targets[galvo_index] = [clamped_px, clamped_py]
+
+                galvo_result = self.coordinate_transform.pixel_to_galvo_code(
+                    predicted_pos[0], predicted_pos[1],
+                    self.image_width, self.image_height,
+                    galvo_index=galvo_index
+                )
+
+                if galvo_result:
+                    galvo_x, galvo_y = self.clamp_to_galvo_limits(galvo_index, galvo_result[0], galvo_result[1])
+                    with self.position_lock:
+                        self.target_galvo_positions[galvo_index] = [galvo_x, galvo_y]
+                        self.active_galvo_index = galvo_index
 
     def predict_position(self, dt, galvo_index):
         """预测未来位置"""
@@ -850,7 +858,7 @@ class LaserWeedingNode:
             #                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
         # 绘制所有振镜的激光瞄准位置
-        previous_profile = getattr(self.coordinate_transform, 'active_profile_index', None)
+        previous_profile = getattr(self.coordinate_transform, 'active_profile_index', None) if self.coordinate_transform else None
         legend_entries = []
         palette = [
             (255, 170, 0),
@@ -863,15 +871,24 @@ class LaserWeedingNode:
                 if not isinstance(active_pos, (list, tuple)) or len(active_pos) < 2:
                     continue
 
-                try:
-                    self.coordinate_transform.set_active_galvo_profile(idx)
-                    galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
-                        active_pos[0], active_pos[1],
-                        self.image_width, self.image_height
-                    )
-                except Exception as exc:
-                    rospy.logdebug(f"Failed reverse transform for galvo {idx}: {exc}")
-                    galvo_pixel = None
+                galvo_pixel = None
+
+                if self.coordinate_transform and self.use_reverse_projection:
+                    try:
+                        self.coordinate_transform.set_active_galvo_profile(idx)
+                        galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
+                            active_pos[0], active_pos[1],
+                            self.image_width, self.image_height
+                        )
+                    except Exception as exc:
+                        rospy.logdebug(f"Failed reverse transform for galvo {idx}: {exc}")
+                        galvo_pixel = None
+
+                if galvo_pixel is None:
+                    with self.position_lock:
+                        pixel_target = self.galvo_pixel_targets[idx][:] if self.galvo_pixel_targets[idx] else None
+                    if pixel_target and pixel_target[0] is not None and pixel_target[1] is not None:
+                        galvo_pixel = pixel_target
 
                 if galvo_pixel is None:
                     legend_entries.append((f"G{idx}: 坐标未知", (0, 0, 255)))
@@ -919,7 +936,7 @@ class LaserWeedingNode:
             cv2.putText(result, "GALVO DISPLAY ERROR", (10, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         finally:
-            if previous_profile is not None:
+            if previous_profile is not None and self.coordinate_transform:
                 try:
                     self.coordinate_transform.set_active_galvo_profile(previous_profile)
                 except Exception:

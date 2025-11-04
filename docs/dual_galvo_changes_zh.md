@@ -18,7 +18,8 @@
 - **按配置裁剪硬件数量**：根据 `CameraGalvoTransform` 返回的 profile 数量与 Teensy 实际支持数量计算 `galvo_count`，并将 `cam_params.yaml` 中的每头边界读入 `self.galvo_limits`，随后通过 `_configure_controller_limits` 主动下发到固件。【F:scripts/main.py†L92-L137】
 - **统一的限幅与范围判定**：新增 `clamp_to_galvo_limits`、`is_within_galvo_limits` 等工具，将预测轨迹、实时调度及状态发布均约束在各自限幅内；`in_galvo_scan_range`、`galvo_control_loop`、`update_position_history` 等流程都调用该逻辑，确保软硬件边界一致。【F:scripts/main.py†L485-L758】
 - **运行状态回传边界信息**：`publish_status` 增加 `galvo_limits` 字段，将每个振镜的 X/Y 码值范围发布到 ROS topic，便于上位机监控或调试配置。【F:scripts/main.py†L893-L927】
-- **多振镜瞄准可视化**：`draw_info` 遍历所有振镜位置，按激活/未激活状态绘制不同颜色的十字光标，并在图像上叠加每个振镜的码值与像素坐标，方便同时观察双振镜的瞄准位置。【F:scripts/main.py†L830-L909】
+- **多振镜瞄准可视化**：`draw_info` 遍历所有振镜位置，按激活/未激活状态绘制不同颜色的十字光标；当 `use_reverse_projection` 为 `true` 时调用坐标变换把码值反投影成像素，否则退化为使用预测/调度阶段缓存的像素目标，让离线仿真可以直接以 2D 结果进行比对。【F:scripts/main.py†L45-L56】【F:scripts/main.py†L860-L939】
+- **像素目标缓存**：`update_position_history` 在生成预测点时会记录各振镜当前瞄准的像素坐标，并在可视化阶段加锁读取作为兜底展示，确保即便反投影失败或者处于纯 2D 模式，也能看到每个振镜期望命中的画面位置。【F:scripts/main.py†L662-L695】【F:scripts/main.py†L887-L913】
 
 ## 4. 标定工具
 - **单头偏移换算遵循限幅**：手动标定工具读取当前 profile 的 `galvo_params`、`max_code`、`code_scale` 与 `code_limits`，结合 `CameraGalvoTransform.get_axis_angle_limits(galvo_index)` 返回的正负扫描角，将码值偏移分轴按比例换算成角度并把最终结果写回 `manual_calibration.updated_galvo_params`，避免不同振镜共用相同上限。【F:scripts/galvo_calibrator.py†L653-L737】
@@ -35,7 +36,7 @@
 ## 6. 离线仿真回放
 
 - **ROS bag 图像回放节点**：新增 `bag_image_publisher.py`，可读取指定 bag 文件中的图像/CameraInfo 话题，按设定播放速率重放并刷新时间戳，支持循环播放，方便在无实机摄像头时复现流程。【F:scripts/bag_image_publisher.py†L1-L146】
-- **离线 Launch 配置**：`main_offline.launch` 改为启动新的 bag 回放节点，通过参数控制 bag 路径、输入输出话题与播放速率，实现以 bag 图像替代实时视频的离线仿真测试。【F:launch/main_offline.launch†L74-L90】
+- **离线 Launch 配置**：`main_offline.launch` 改为启动新的 bag 回放节点，通过参数控制 bag 路径、输入输出话题与播放速率；同时将 `use_reverse_projection` 设为 `false`，关闭码值反投影，可直接以 2D 像素目标叠加离线画面。【F:launch/main_offline.launch†L74-L92】
 
 以上改动共同实现了：
 1. 一块 Teensy 同时驱动两个振镜并共享激光控制，同时保证每个振镜的安全码值范围独立可调。

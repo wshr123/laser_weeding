@@ -858,7 +858,15 @@ class CameraGalvoTransform:
     def codes_to_angles_mech(self, cx, cy):
         # 直接乘矩阵： [alpha; beta] = M * ([cx;cy] - [bx;by])
         p = self.galvo_lin
-        v = np.array([float(cx) - p.bx, float(cy) - p.by], dtype=float)
+        profile = self._get_profile(self.active_profile_index)
+
+        scale_x = profile.code_scale[0] if profile.code_scale[0] != 0 else 1.0
+        scale_y = profile.code_scale[1] if profile.code_scale[1] != 0 else 1.0
+
+        base_cx = (float(cx) - profile.code_offset[0]) / scale_x
+        base_cy = (float(cy) - profile.code_offset[1]) / scale_y
+
+        v = np.array([base_cx - p.bx, base_cy - p.by], dtype=float)
         M = np.array([[p.kx, p.axy],
                       [p.ayx, p.ky]], dtype=float)
         alpha, beta = (M @ v).tolist()
