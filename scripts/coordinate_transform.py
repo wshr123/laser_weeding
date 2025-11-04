@@ -41,9 +41,18 @@ def resolve_config_path(config_file: Optional[str]) -> str:
 
 
 @dataclass
+class ExtrinsicsSet:
+    t_gc: np.ndarray
+    R_gc: np.ndarray
+    q_gc: np.ndarray
+
+
+@dataclass
 class GalvoHeadProfile:
     index: int
     name: str
+    extrinsics: Dict[str, ExtrinsicsSet]
+    active_key: str
     t_gc: np.ndarray
     R_gc: np.ndarray
     q_gc: np.ndarray
@@ -100,11 +109,6 @@ class CameraGalvoTransform:
         'manual_calibration': {
             'enabled': False,
             'result_file': '',
-            'apply_extrinsics': True,
-            'apply_bias': True,
-            'apply_code_limits': True,
-            'match_by_name': True,
-            'fallback_to_id': True,
         },
     }
 
@@ -117,6 +121,9 @@ class CameraGalvoTransform:
         self.params = self._load_params(self.config_file_path)
         mode_cfg = self.params.get('transform_mode', {})
         self.use_3d_transform = bool(mode_cfg.get('use_3d_transform', self.use_3d_transform))
+
+        self.active_extrinsics_map: Dict[str, ExtrinsicsSet] = {}
+        self.active_extrinsics_key: str = 'rough'
 
         self._build_camera_model()
         self._build_work_plane()
@@ -187,17 +194,12 @@ class CameraGalvoTransform:
             rospy.logwarn(f'Failed to load manual calibration file {manual_path}: {exc}')
             return
 
-        galvos = params.setdefault('galvos', [])
         overrides = manual_data.get('galvos', []) if isinstance(manual_data, dict) else []
         if not isinstance(overrides, list) or not overrides:
             rospy.logwarn_once('Manual calibration file does not contain galvos list')
             return
 
-        apply_extr = bool(cfg.get('apply_extrinsics', True))
-        apply_bias = bool(cfg.get('apply_bias', True))
-        apply_limits = bool(cfg.get('apply_code_limits', True))
-        match_by_name = bool(cfg.get('match_by_name', True))
-        fallback_to_id = bool(cfg.get('fallback_to_id', True))
+        galvos = params.setdefault('galvos', [])
 
         name_to_index = {
             entry.get('name', f'galvo_{idx}'): idx
@@ -211,9 +213,9 @@ class CameraGalvoTransform:
 
             idx: Optional[int] = None
             name = override.get('name')
-            if match_by_name and name in name_to_index:
+            if name and name in name_to_index:
                 idx = name_to_index[name]
-            elif fallback_to_id:
+            else:
                 try:
                     candidate = int(override.get('id'))
                 except (TypeError, ValueError):
@@ -227,20 +229,28 @@ class CameraGalvoTransform:
                 name_to_index[galvos[idx]['name']] = idx
 
             entry = galvos[idx]
-            if apply_extr and isinstance(override.get('extrinsics'), dict):
-                entry.setdefault('extrinsics', {}).update(override['extrinsics'])
+            if name:
+                entry.setdefault('name', name)
 
-            if apply_bias:
-                manual_info = override.get('manual_calibration', {})
-                updated = manual_info.get('updated_galvo_params', {}) if isinstance(manual_info, dict) else {}
-                entry.setdefault('galvo_params', {}).update(updated)
-                angle_bias = manual_info.get('angle_bias', {}) if isinstance(manual_info, dict) else {}
-                for key in ('bias_x', 'bias_y'):
-                    if key in angle_bias:
-                        entry.setdefault('galvo_params', {})[key] = angle_bias[key]
+            refined = override.get('refined_extrinsics') or override.get('extrinsics')
+            if isinstance(refined, dict):
+                extr_cfg = entry.setdefault('extrinsics', {})
+                extr_cfg['refined'] = refined
+                active_name = override.get('active_extrinsics', 'refined')
+                if not isinstance(active_name, str) or active_name not in ('rough', 'refined'):
+                    active_name = 'refined'
+                extr_cfg['active'] = active_name
 
-            if apply_limits and isinstance(override.get('code_limits'), dict):
-                entry['code_limits'] = override['code_limits']
+            manual_info = override.get('manual_calibration')
+            if isinstance(manual_info, dict):
+                entry.setdefault('manual_calibration', {}).update(manual_info)
+                updated = manual_info.get('updated_galvo_params')
+                if isinstance(updated, dict):
+                    entry.setdefault('galvo_params', {}).update(updated)
+
+            code_limits = override.get('code_limits')
+            if isinstance(code_limits, dict):
+                entry['code_limits'] = code_limits
 
     # ------------------------------------------------------------------
     # Profile construction
@@ -328,6 +338,53 @@ class CameraGalvoTransform:
             'y_minus': pick('scan_angle_y_minus'),
         }
 
+    def _create_extrinsics_set(
+        self,
+        source: Optional[Dict[str, object]],
+        fallback: Optional[Dict[str, object]]
+    ) -> ExtrinsicsSet:
+        src_dict = source or {}
+        fallback_dict = fallback or {}
+        translation = self._parse_translation(src_dict, fallback_dict)
+        rotation = self._parse_rotation(src_dict, fallback_dict)
+        return ExtrinsicsSet(
+            t_gc=translation,
+            R_gc=rotation.as_matrix(),
+            q_gc=rotation.as_quat(),
+        )
+
+    def _prepare_extrinsics(
+        self,
+        entry_extr: Optional[Dict[str, object]],
+        base_extr: Dict[str, object]
+    ) -> Tuple[ExtrinsicsSet, Dict[str, ExtrinsicsSet], str]:
+        extr_dict: Dict[str, ExtrinsicsSet] = {}
+        entry = entry_extr or {}
+        base_dict = base_extr or {}
+
+        rough_source = entry.get('rough') if isinstance(entry, dict) else None
+        refined_source = entry.get('refined') if isinstance(entry, dict) else None
+        active_override = entry.get('active') if isinstance(entry, dict) else None
+
+        extr_dict['rough'] = self._create_extrinsics_set(
+            rough_source if isinstance(rough_source, dict) else None,
+            base_dict,
+        )
+
+        if isinstance(refined_source, dict):
+            refined_fallback = rough_source if isinstance(rough_source, dict) else base_dict
+            extr_dict['refined'] = self._create_extrinsics_set(refined_source, refined_fallback)
+
+        if isinstance(active_override, str) and active_override in extr_dict:
+            active_key = active_override
+        elif 'refined' in extr_dict:
+            active_key = 'refined'
+        else:
+            active_key = 'rough'
+
+        active = extr_dict[active_key]
+        return active, extr_dict, active_key
+
     def _build_galvo_profiles(self) -> None:
         self._galvo_profiles: List[GalvoHeadProfile] = []
 
@@ -341,13 +398,9 @@ class CameraGalvoTransform:
         for idx, entry in enumerate(galvos):
             entry = entry or {}
             name = entry.get('name', f'galvo_{idx}')
-            extr = entry.get('extrinsics', {}) if isinstance(entry, dict) else {}
+            extr_config = entry.get('extrinsics', {}) if isinstance(entry, dict) else {}
+            active_extr, extr_map, active_key = self._prepare_extrinsics(extr_config, base_extrinsics)
             galvo_params = self._combine_galvo_params(entry.get('galvo_params'))
-            rotation = self._parse_rotation(extr, base_extrinsics)
-            R_gc = rotation.as_matrix()
-            q_gc = rotation.as_quat()
-            t_gc = self._parse_translation(extr, base_extrinsics)
-
             code_offset = np.array(entry.get('code_offset', [0.0, 0.0]), dtype=np.float64)
             code_scale = np.array(entry.get('code_scale', [1.0, 1.0]), dtype=np.float64)
             max_code = float(entry.get('max_code', galvo_params.get('max_code', 32767)))
@@ -357,9 +410,11 @@ class CameraGalvoTransform:
             profile = GalvoHeadProfile(
                 index=idx,
                 name=name,
-                t_gc=t_gc,
-                R_gc=R_gc,
-                q_gc=q_gc,
+                extrinsics=extr_map,
+                active_key=active_key,
+                t_gc=active_extr.t_gc,
+                R_gc=active_extr.R_gc,
+                q_gc=active_extr.q_gc,
                 code_offset=code_offset,
                 code_scale=code_scale,
                 max_code=max_code,
@@ -390,6 +445,8 @@ class CameraGalvoTransform:
         self.active_profile_scale = profile.code_scale.copy()
         self.active_galvo_params = dict(profile.galvo_params)
         self.axis_angle_limits = dict(profile.axis_angle_limits)
+        self.active_extrinsics_map = profile.extrinsics
+        self.active_extrinsics_key = profile.active_key
 
         self.t_gc = profile.t_gc.copy()
         self.R_gc = profile.R_gc.copy()
@@ -419,9 +476,11 @@ class CameraGalvoTransform:
         return {
             'index': profile.index,
             'name': profile.name,
+            'active_extrinsics': profile.active_key,
             't_gc_mm': profile.t_gc.tolist(),
             'R_gc': profile.R_gc.tolist(),
             'q_gc_xyzw': profile.q_gc.tolist(),
+            'extrinsics': self._format_extrinsics_map(profile.extrinsics),
             'code_offset': profile.code_offset.tolist(),
             'code_scale': profile.code_scale.tolist(),
             'code_limits': profile.code_limits.tolist(),
@@ -432,6 +491,17 @@ class CameraGalvoTransform:
 
     def list_galvo_profiles(self) -> List[Dict[str, object]]:
         return [self.get_profile_metadata(idx) for idx in range(len(self._galvo_profiles))]
+
+    @staticmethod
+    def _format_extrinsics_map(extr_map: Dict[str, ExtrinsicsSet]) -> Dict[str, Dict[str, object]]:
+        formatted: Dict[str, Dict[str, object]] = {}
+        for key, extr in extr_map.items():
+            formatted[key] = {
+                't_gc_mm': extr.t_gc.tolist(),
+                'R_gc': extr.R_gc.tolist(),
+                'q_gc_xyzw': extr.q_gc.tolist(),
+            }
+        return formatted
 
     # ------------------------------------------------------------------
     # Depth helpers

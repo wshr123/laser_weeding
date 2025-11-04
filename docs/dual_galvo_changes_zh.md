@@ -9,11 +9,11 @@
 - **持续的保活与状态管理**：保留多头平滑插值、保活定时器与急停逻辑，确保每个振镜在新边界生效后仍能收到心跳与超时保护。【F:control_tennsy.ino†L208-L370】
 
 ## 2. 坐标映射 `scripts/coordinate_transform.py`
-- **`GalvoHeadProfile` 扩展字段**：配置驱动的 `GalvoHeadProfile` 现保存每个振镜的外参、码值缩放、偏移、`max_code`、二维 `code_limits` 区间，以及整合后的 `galvo_params` 与逐轴角度上限，初始化时同步到运行态缓存。【F:scripts/coordinate_transform.py†L43-L139】【F:scripts/coordinate_transform.py†L313-L370】
+- **`GalvoHeadProfile` 扩展字段**：每个 profile 同时缓存手工粗测 (`rough`) 与精调 (`refined`) 外参，记录激活来源 `active_extrinsics`，并连同码值缩放、偏移、`max_code` 与二维 `code_limits` 写入运行态缓存，方便随时切换外参版本核对差异。【F:scripts/coordinate_transform.py†L37-L139】【F:scripts/coordinate_transform.py†L313-L370】
 - **统一的限幅/元数据接口**：提供 `get_galvo_profile_count`、`get_code_limits`、`get_profile_metadata` 与 `list_galvo_profiles`，供上位机和标定工具检索每个振镜的独立边界与补偿参数；`get_transform_info` 会回传激活 profile 的角度/码值信息。【F:scripts/coordinate_transform.py†L331-L435】【F:scripts/coordinate_transform.py†L726-L735】
 - **角度/码值双向转换带 Profile**：`angles_to_codes` 与 `codes_to_angles` 在计算后引用各自 profile 的缩放、偏移、`max_code` 与角度限值，保证正反向转换都受配置文件约束，与保存在控制器/固件中的上限一致。【F:scripts/coordinate_transform.py†L551-L604】
 - **非对称扫描角映射**：`_compute_axis_angle_limits` 支持每个振镜独立的 `scan_angle_x_plus` / `scan_angle_x_minus` / `scan_angle_y_plus` / `scan_angle_y_minus`，并在 profile 切换时更新缓存，使不同方向的最大角度都能正确换算成码值并参与限幅。【F:scripts/coordinate_transform.py†L313-L329】【F:scripts/coordinate_transform.py†L551-L604】
-- **手工标定覆盖**：读取 `cam_params.yaml` 中的 `manual_calibration` 配置后，会解析 `manual_galvo_calibration.yaml`，按振镜名称或编号套用手工标定的外参、偏置与码值范围，保持运行时参数与人工调校一致。【F:cam_params.yaml†L78-L85】【F:scripts/coordinate_transform.py†L170-L244】
+- **手工标定覆盖**：读取 `cam_params.yaml` 中的 `manual_calibration` 配置后，会解析 `manual_galvo_calibration.yaml`，按振镜名称或编号写入 `refined_extrinsics` 并自动切换为激活外参，同时保留标定得到的偏置与限幅，保证运行时参数与人工调校一致。【F:cam_params.yaml†L78-L85】【F:scripts/coordinate_transform.py†L170-L244】
 
 ## 3. 主控制节点 `scripts/main.py`
 - **按配置裁剪硬件数量**：根据 `CameraGalvoTransform` 返回的 profile 数量与 Teensy 实际支持数量计算 `galvo_count`，并将 `cam_params.yaml` 中的每头边界读入 `self.galvo_limits`，随后通过 `_configure_controller_limits` 主动下发到固件。【F:scripts/main.py†L92-L137】
@@ -24,14 +24,14 @@
 
 ## 4. 标定工具
 - **单头偏移换算遵循限幅**：手动标定工具读取当前 profile 的 `galvo_params`、`max_code`、`code_scale` 与 `code_limits`，结合 `CameraGalvoTransform.get_axis_angle_limits(galvo_index)` 返回的正负扫描角，将码值偏移分轴按比例换算成角度并把最终结果写回 `manual_calibration.updated_galvo_params`，避免不同振镜共用相同上限。【F:scripts/galvo_calibrator.py†L653-L737】
-- **三维标定写回独立参数**：`galvo_calibrator_depth.py` 生成更新配置时会深拷贝当前参数，并仅修改目标振镜的 `galvo_params.bias_x/bias_y`，确保多振镜独立角度与偏移不会互相覆盖。【F:scripts/galvo_calibrator_depth.py†L912-L925】
+- **三维标定直接写入精调外参**：深度标定完成后把求得的 `R_gc`、`t_gc` 与验证残差写入 `refined_extrinsics`，同时标记 `active_extrinsics` 为 `refined`，供坐标变换与上位机立即套用，无需再生成额外的更新配置文件。【F:scripts/galvo_calibrator_depth.py†L840-L907】
 - **自动计算残差验证标定精度**：三维标定完成后立即把相机点云变换到振镜系，与实测点做差并输出 RMSE/最大误差，同时把每个样本的残差、均方统计写入结果文件，方便后续加载时核对精度。【F:scripts/galvo_calibrator_depth.py†L768-L868】
 
 ## 5. 位机串口控制 `scripts/send_to_teensy.py`
 - **上位机缓存限幅并推送固件**：控制器维护 `self.galvo_limits`，在 `move_to_position` 前先做本地限幅，`configure_limits` 则向固件发送 `LIMITS` 命令并同步缓存，确保上下位机对安全范围认知一致。【F:scripts/send_to_teensy.py†L29-L137】【F:scripts/send_to_teensy.py†L218-L247】
 - **螺旋模式配置**：提供 `set_laser_mode` 与 `configure_spiral`，使上位机可以切换点灼或螺旋灼烧，并调整半径、圈距和驻留时间等参数。【F:scripts/send_to_teensy.py†L180-L207】
 
-- **按头定义工作范围**：`galvos` 列表为左右振镜分别记录外参、`max_code` 与 `code_limits`，供坐标映射、上位机与固件限幅使用，避免两只振镜共享相同的最大扫描范围。【F:cam_params.yaml†L33-L66】
+- **按头定义工作范围与外参版本**：`galvos` 列表为左右振镜分别记录粗测/精调外参、`max_code` 与 `code_limits`，供坐标映射、上位机与固件限幅使用，避免两只振镜共享相同的最大扫描范围并方便对比不同外参的效果。【F:cam_params.yaml†L33-L66】
 - **每头独立角度参数**：每个 `galvos[].galvo_params` 保存独立的 `scan_angle`、各轴正负扫描角、比例因子与偏移；上位机按 profile 读取这些值进行角度与码值的正反转换。【F:cam_params.yaml†L41-L66】【F:scripts/coordinate_transform.py†L313-L370】
 - **保留全局默认值**：顶层 `galvo_params` 继续提供缺省角度字段，作为未显式配置振镜或新 profile 的兜底值。【F:cam_params.yaml†L21-L31】【F:scripts/coordinate_transform.py†L313-L329】
 

@@ -858,7 +858,8 @@ class ManualGalvoCalibrationNode:
             'id': self.galvo_index,
             'name': self.galvo_name,
             'calibration_info': calibration_info,
-            'extrinsics': extrinsics,
+            'refined_extrinsics': extrinsics,
+            'active_extrinsics': 'refined',
             'validation': validation_metrics,
             'code_limits': {
                 'x': [int(self.galvo_limits[0][0]), int(self.galvo_limits[0][1])],
@@ -943,26 +944,6 @@ class ManualGalvoCalibrationNode:
         t = centroid_B.T - R @ centroid_A.T
         return R, t.reshape(3, 1)
 
-    def generate_updated_config(self, calibration_result):
-        try:
-            original_config = copy.deepcopy(self.coordinate_transform.params)
-            angle_bias = calibration_result['angle_bias']
-
-            galvo_entries = original_config.get('galvos', []) or []
-            if 0 <= self.galvo_index < len(galvo_entries):
-                target_params = galvo_entries[self.galvo_index].setdefault('galvo_params', {})
-            else:
-                target_params = original_config.setdefault('galvo_params', {})
-
-            target_params['bias_x'] = angle_bias['bias_x']
-            target_params['bias_y'] = angle_bias['bias_y']
-            base_name = os.path.splitext(self.calibration_result_file)[0]
-            updated_config_file = f"{base_name}_updated_config.yaml"
-            with open(updated_config_file, 'w') as f:
-                yaml.dump(original_config, f, default_flow_style=False)
-            rospy.loginfo(f"Updated configuration saved to: {updated_config_file}")
-        except Exception as e:
-            rospy.logerr(f"Failed to generate updated config: {e}")
 
     def reset_calibration(self):
         self.calibration_state = "IDLE"

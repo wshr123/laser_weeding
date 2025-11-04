@@ -765,31 +765,9 @@ class ManualGalvoCalibrationNode:
                 yaml.dump(existing_data, f, default_flow_style=False)
 
             rospy.loginfo(f"Manual calibration saved to: {self.calibration_result_file}")
-            self.generate_updated_config(angle_bias)
 
         except Exception as e:
             rospy.logerr(f"Failed to save calibration: {e}")
-
-    def generate_updated_config(self, angle_bias):
-        """生成更新的配置文件"""
-        try:
-            original_config = self.coordinate_transform.params.copy()
-            # 更新galvo_params中的bias值
-            original_config['galvo_params']['bias_x'] = angle_bias['bias_x']
-            original_config['galvo_params']['bias_y'] = angle_bias['bias_y']
-
-            # 生成更新的配置文件名
-            base_name = os.path.splitext(self.calibration_result_file)[0]
-            updated_config_file = f"{base_name}_updated_config.yaml"
-
-            with open(updated_config_file, 'w') as f:
-                yaml.dump(original_config, f, default_flow_style=False)
-
-            rospy.loginfo(f"Updated configuration saved to: {updated_config_file}")
-            rospy.loginfo("You can use this updated config file in your main program")
-
-        except Exception as e:
-            rospy.logerr(f"Failed to generate updated config: {e}")
 
     def reset_calibration(self):
         """重置校准"""

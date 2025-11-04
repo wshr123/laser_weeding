@@ -33,8 +33,13 @@ galvo_params:
 galvos:
   - name: left_head
     extrinsics:
-      t_gc_mm: [-120.0, 100.0, 0.0]
-      q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      rough:
+        t_gc_mm: [-120.0, 100.0, 0.0]
+        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      refined:
+        t_gc_mm: [-122.5, 102.0, 1.5]
+        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      active: refined
     code_offset: [0.0, 0.0]
     code_scale: [1.0, 1.0]
     max_code: 31500
@@ -55,8 +60,13 @@ galvos:
 
   - name: right_head
     extrinsics:
-      t_gc_mm: [120.0, 100.0, 0.0]
-      q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      rough:
+        t_gc_mm: [120.0, 100.0, 0.0]
+        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      refined:
+        t_gc_mm: [118.7, 99.5, -1.2]
+        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+      active: refined
     code_offset: [0.0, 0.0]
     code_scale: [1.0, 1.0]
     max_code: 32000
@@ -77,9 +87,4 @@ galvos:
 
 manual_calibration:
   enabled: true                      # 启用手工标定结果自动加载
-  result_file: manual_galvo_calibration.yaml  # 标定输出文件（相对仓库根目录或绝对路径）
-  apply_extrinsics: true             # 使用手工标定的外参覆盖配置中的值
-  apply_bias: true                   # 使用手工标定的偏置/比例更新 galvo_params
-  apply_code_limits: true            # 如有需要，更新码值范围
-  match_by_name: true                # 通过 name 优先匹配振镜
-  fallback_to_id: true               # 如 name 未匹配，则按 id 匹配
+  result_file: manual_galvo_calibration.yaml  # 标定输出文件
