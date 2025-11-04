@@ -1,46 +1,43 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""Camera ↔ Galvo coordinate utilities.
+
+This module keeps the minimal surface that the rest of the project relies on
+while staying readable: load parameters, manage multiple galvo heads and
+provide simple helpers for forward/backward projections.
+"""
+
+from __future__ import annotations
+
+import copy
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import rospy
 import yaml
-import cv2
-from onnx.reference.ops.op_non_max_suppression import PrepareContext
 from scipy.spatial.transform import Rotation
-import os
-import copy
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 PACKAGE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 DEFAULT_CONFIG_PATH = os.path.join(PACKAGE_ROOT, 'cam_params.yaml')
 
 
 def resolve_config_path(config_file: Optional[str]) -> str:
-    """Resolve the configuration file path relative to the package root."""
+    """Resolve configuration paths relative to the repository root."""
 
-    if config_file:
-        expanded = os.path.expanduser(config_file)
-        if os.path.isabs(expanded):
-            return expanded
+    if not config_file:
+        return DEFAULT_CONFIG_PATH
 
-        package_candidate = os.path.join(PACKAGE_ROOT, expanded)
-        if os.path.exists(package_candidate):
-            return package_candidate
+    expanded = os.path.expanduser(config_file)
+    if os.path.isabs(expanded):
+        return expanded
 
-        return os.path.abspath(expanded)
+    package_candidate = os.path.join(PACKAGE_ROOT, expanded)
+    if os.path.exists(package_candidate):
+        return package_candidate
 
-    return DEFAULT_CONFIG_PATH
-
-@dataclass
-class GalvoParams:
-    Z_mm: float = 107.0          # 工作面参考距离（正向时会用实时 point_g[2] 覆盖）
-    bx: float = 0.0             # code 偏置
-    by: float = 0.0
-    kx: float = 0.0             # alpha <- cx
-    ky: float = 0.0             # beta  <- cy
-    axy: float = -1.236e-5      # alpha <- cy
-    ayx: float = -1.218e-5      # beta  <- cx
+    return os.path.abspath(expanded)
 
 
 @dataclass
@@ -59,570 +56,303 @@ class GalvoHeadProfile:
 
 
 class CameraGalvoTransform:
-    """
-    相机-振镜坐标变换类
-    支持两种模式：
-    1) 3D几何变换：像素 → 相机光线/深度 → 振镜系点 → 振镜角 → 码值
-       反向：码值 → 振镜角 → 振镜射线 → 选择相同深度面/固定深度面/工作平面 → 相机像素
-    2) 简单线性映射（回退方案）
-    """
+    """Coordinate transform helper for multiple galvo heads."""
 
-    def __init__(self, config_file=DEFAULT_CONFIG_PATH, use_3d_transform=True):
+    DEFAULT_PARAMS: Dict[str, object] = {
+        'transform_mode': {
+            'use_3d_transform': True,
+        },
+        'camera_matrix': {
+            'fx': 500.0,
+            'fy': 500.0,
+            'cx': 320.0,
+            'cy': 240.0,
+        },
+        'distortion_coeffs': [],
+        'extrinsics': {
+            't_gc': [0.0, 100.0, 0.0],
+            'q_gc': [0.0, 0.0, 0.0, 1.0],
+        },
+        'work_plane': {
+            'n_g': [0.0, 0.0, 1.0],
+            'd_g': -1000.0,
+        },
+        'galvo_params': {
+            'scan_angle': 30.0,
+            'scan_angle_x_plus': 15.0,
+            'scan_angle_x_minus': 15.0,
+            'scan_angle_y_plus': 15.0,
+            'scan_angle_y_minus': 15.0,
+            'scale_x': 1.0,
+            'scale_y': 1.0,
+            'bias_x': 0.0,
+            'bias_y': 0.0,
+            'max_code': 32767,
+        },
+        'simple_mapping': {
+            'use_safe_range': True,
+            'max_safe_range': 32767,
+            'protocol_max': 32767,
+            'offset_x': 0,
+            'offset_y': 0,
+        },
+        'galvos': [],
+        'manual_calibration': {
+            'enabled': False,
+            'result_file': '',
+            'apply_extrinsics': True,
+            'apply_bias': True,
+            'apply_code_limits': True,
+            'match_by_name': True,
+            'fallback_to_id': True,
+        },
+    }
+
+    def __init__(self, config_file: Optional[str] = None, use_3d_transform: bool = True):
         rospy.loginfo("Initializing camera-galvo coordinate transformer...")
 
-        resolved_config_file = resolve_config_path(config_file)
-        if not os.path.exists(resolved_config_file):
-            rospy.logwarn(f"Transform config {resolved_config_file} does not exist, using defaults where possible")
+        self.config_file_path = resolve_config_path(config_file)
+        self.use_3d_transform = bool(use_3d_transform)
 
-        self.config_file_path = resolved_config_file
-        self.use_3d_transform = use_3d_transform
-        self.manual_calibration_report: Optional[Dict[str, object]] = None
+        self.params = self._load_params(self.config_file_path)
+        mode_cfg = self.params.get('transform_mode', {})
+        self.use_3d_transform = bool(mode_cfg.get('use_3d_transform', self.use_3d_transform))
 
-        self.default_params = {
-            'transform_mode': {
-                'use_3d_transform': use_3d_transform,
-                'fallback_to_simple': True
-            },
-            'camera_matrix': {
-                'fx': 500.0,
-                'fy': 500.0,
-                'cx': 320.0,
-                'cy': 240.0
-            },
-            'distortion_coeffs': [],
-            'extrinsics': {
-                't_gc': [0.0, 100.0, 0.0],  # 相机在振镜坐标系的位置（mm）
-                'q_gc': [0.0, 0.0, 0.0, 1.0]  # 相机→振镜的旋转（xyzw）
-            },
-            'work_plane': {
-                'n_g': [0.0, 0.0, 1.0],  # 振镜系下工作平面法向
-                'd_g': -1000.0           # 平面方程 n·X + d = 0
-            },
-            'galvo_params': {
-                'scan_angle': 30.0,  # 总扫描角（deg）
-                'scan_angle_x_plus': 15.0,
-                'scan_angle_x_minus': 15.0,
-                'scan_angle_y_plus': 15.0,
-                'scan_angle_y_minus': 15.0,
-                'scale_x': 1.0,
-                'scale_y': 1.0,
-                'bias_x': 0.0,
-                'bias_y': 0.0,
-                'max_code': 32767
-            },
-            'simple_mapping': {
-                'use_safe_range': True,
-                'max_safe_range': 32767,
-                'protocol_max': 32767,
-                'scale_factor': 65536,
-                'offset_x': 0,
-                'offset_y': 0,
-            },
-            'mech_compensation': {
-                'enabled': True,
-                'Z_mm': 76.0,
-                'bx': 0.0, 'by': 0.0,
-                'kx': 0.0, 'ky': 0.0,
-                'axy': -1.236e-5, 'ayx': -1.218e-5
-            },
-            'galvos': []
+        self._build_camera_model()
+        self._build_work_plane()
+        self._build_galvo_profiles()
 
-        }
+        self.depth_query_func = None
+        self.fixed_reverse_depth_z_mm: Optional[float] = None
+        self.last_hit_point_g: Optional[np.ndarray] = None
+        self.last_pixel_pos: Optional[Tuple[float, float]] = None
+        self.last_galvo_pos: Optional[Tuple[int, int]] = None
+        self.transform_valid = True
+        self.transform_method_used = 'Simple mapping'
 
-        default_half_angle = float(self.default_params['galvo_params']['scan_angle']) / 2.0
-        self.axis_angle_limits = {
-            'x_plus': float(self.default_params['galvo_params'].get('scan_angle_x_plus', default_half_angle)),
-            'x_minus': float(self.default_params['galvo_params'].get('scan_angle_x_minus', default_half_angle)),
-            'y_plus': float(self.default_params['galvo_params'].get('scan_angle_y_plus', default_half_angle)),
-            'y_minus': float(self.default_params['galvo_params'].get('scan_angle_y_minus', default_half_angle)),
-        }
+        if not self._galvo_profiles:
+            raise RuntimeError('No galvo profile available – please check cam_params.yaml')
 
-        # 在加载配置之前，先使用默认外参初始化基础姿态，
-        # 以便即便禁用 3D 反投影也能正常构建振镜 profile。
-        default_ext = self.default_params['extrinsics']
-        self.t_gc = np.array(default_ext['t_gc'], dtype=np.float64)
-        self.q_gc = np.array(default_ext['q_gc'], dtype=np.float64)
-        self.R_gc = Rotation.from_quat(self.q_gc).as_matrix()
-
-        self.load_config(self.config_file_path)
-        self._refresh_base_extrinsics_from_params()
-
-        if self.use_3d_transform:
-            self.init_3d_transform()
-
-        self.init_simple_mapping()
-
-        self._galvo_profiles: List[GalvoHeadProfile] = []
-        self.active_profile_index: int = 0
-        self.active_profile_limits = np.array([
-            [-32767.0, 32767.0],
-            [-32767.0, 32767.0]
-        ], dtype=np.float64)
-        self.active_profile_max_code: float = float(self.params['galvo_params'].get('max_code', 32767))
-        self.active_profile_scale = np.ones(2, dtype=np.float64)
-        self.active_profile_offset = np.zeros(2, dtype=np.float64)
-        self.active_galvo_params: Dict[str, float] = dict(self.params.get('galvo_params', {}))
-        self._load_galvo_profiles()
         self.set_active_galvo_profile(0)
 
-        # 运行态变量
-        self.last_pixel_pos = None
-        self.last_galvo_pos = None
-        self.transform_valid = True
-        self.transform_method_used = "Unknown"
-        self.transform_fail_count = 0
+        rospy.loginfo("Camera-galvo coordinate transformer ready")
 
-        # 深度查询回调
-        self.depth_query_func = None
+    # ------------------------------------------------------------------
+    # Configuration helpers
+    # ------------------------------------------------------------------
 
-        # 反向回投时优先使用的“上一命中点”（来自像素+深度的正向分支）
-        self.last_hit_point_g = None  # 振镜系 [x,y,z] mm
-        # 可选的固定深度面（振镜系 z = const，单位 mm）
-        self.fixed_reverse_depth_z_mm = None
+    @classmethod
+    def _merge_dict(cls, target: Dict[str, object], update: Dict[str, object]) -> None:
+        for key, value in update.items():
+            if isinstance(target.get(key), dict) and isinstance(value, dict):
+                cls._merge_dict(target[key], value)
+            else:
+                target[key] = value
 
-        self.reverse_theta_x = None
-        self.reverse_theta_y = None
-
-        # 机械畸变补偿
-        self.use_mech_compensation = True
-        self.galvo_lin = GalvoParams()
-
-        rospy.loginfo("Camera-galvo coordinate transformer initialized successfully")
-
-    # -------------------- 参数与初始化 --------------------
-
-    def load_config(self, config_file):
-        self.params = copy.deepcopy(self.default_params)
+    def _load_params(self, config_file: str) -> Dict[str, object]:
+        params = copy.deepcopy(self.DEFAULT_PARAMS)
 
         if config_file and os.path.exists(config_file):
             try:
-                with open(config_file, 'r') as f:
-                    config = yaml.safe_load(f)
-                    # 读取机械补偿参数
-                    mc = self.params.get('mech_compensation', {})
-                    self.use_mech_compensation = bool(mc.get('enabled', True))
-                    self.galvo_lin = GalvoParams(
-                        Z_mm=float(mc.get('Z_mm', 76.0)),
-                        bx=float(mc.get('bx', 0.0)),
-                        by=float(mc.get('by', 0.0)),
-                        kx=float(mc.get('kx', 0.0)),
-                        ky=float(mc.get('ky', 0.0)),
-                        axy=float(mc.get('axy', -1.236e-5)),
-                        ayx=float(mc.get('ayx', -1.218e-5)),
-                    )
-                    self.update_params_recursive(self.params, config)
-
-                if 'transform_mode' in config:
-                    self.use_3d_transform = config['transform_mode'].get('use_3d_transform', self.use_3d_transform)
-            except Exception as e:
-                rospy.logwarn(f"Failed to load config file, using default parameters: {e}")
+                with open(config_file, 'r') as stream:
+                    user_params = yaml.safe_load(stream) or {}
+                self._merge_dict(params, user_params)
+            except Exception as exc:  # pragma: no cover - just a safety log
+                rospy.logwarn(f"Failed to read config file {config_file}: {exc}")
         else:
-            rospy.loginfo("Using default configuration parameters")
+            rospy.logwarn_once(f"Config file {config_file} not found – using defaults")
 
-        self._apply_manual_calibration_overrides()
-        self._update_axis_angle_limits()
+        self._apply_manual_calibration(params)
+        return params
 
-    def _refresh_base_extrinsics_from_params(self) -> None:
-        """从当前参数表刷新基础外参姿态，保证非 3D 模式也有有效的 t_gc/R_gc。"""
-
-        extrinsics = self.params.get('extrinsics', {}) or {}
-
-        t_gc_values = extrinsics.get('t_gc_mm', extrinsics.get('t_gc', None))
-        if t_gc_values is None:
-            t_gc_values = self.default_params['extrinsics']['t_gc']
-        self.t_gc = np.array(t_gc_values, dtype=np.float64)
-
-        # 处理姿态，优先使用矩阵，其次是四元数。
-        if 'R_gc' in extrinsics:
-            R_gc = np.array(extrinsics['R_gc'], dtype=np.float64)
-            try:
-                rot = Rotation.from_matrix(R_gc)
-            except ValueError:
-                rot = Rotation.from_quat(self.default_params['extrinsics']['q_gc'])
-        else:
-            quat = extrinsics.get('q_gc_xyzw', extrinsics.get('q_gc', None))
-            if quat is None:
-                quat = self.default_params['extrinsics']['q_gc']
-            quat = np.array(quat, dtype=np.float64)
-            if quat.shape != (4,):
-                quat = np.array(self.default_params['extrinsics']['q_gc'], dtype=np.float64)
-            # scipy 要求规范化四元数
-            norm = np.linalg.norm(quat)
-            if norm == 0:
-                quat = np.array(self.default_params['extrinsics']['q_gc'], dtype=np.float64)
-            else:
-                quat = quat / norm
-            rot = Rotation.from_quat(quat)
-
-        self.R_gc = rot.as_matrix()
-        self.q_gc = rot.as_quat()
-
-    def update_params_recursive(self, default_dict, update_dict):
-        for key, value in update_dict.items():
-            if key in default_dict and isinstance(default_dict[key], dict) and isinstance(value, dict):
-                self.update_params_recursive(default_dict[key], value)
-            else:
-                default_dict[key] = value
-
-    def _apply_manual_calibration_overrides(self) -> None:
-        manual_cfg = self.params.get('manual_calibration', {}) or {}
-        report = {
-            'enabled': bool(manual_cfg.get('enabled', False)),
-            'applied': False,
-            'path': None,
-            'profiles': [],
-            'load_error': None,
-        }
-        self.manual_calibration_report = report
-
-        if not report['enabled']:
+    def _apply_manual_calibration(self, params: Dict[str, object]) -> None:
+        cfg = params.get('manual_calibration') or {}
+        if not cfg.get('enabled'):
             return
 
-        manual_file = manual_cfg.get('result_file') or manual_cfg.get('file')
-        if not manual_file:
-            rospy.logwarn_once("Manual calibration enabled but no result_file provided")
-            report['load_error'] = 'missing result_file'
+        result_file = cfg.get('result_file') or cfg.get('file')
+        if not result_file:
+            rospy.logwarn_once('Manual calibration enabled but result_file is empty')
             return
 
-        manual_path = resolve_config_path(manual_file)
-        report['path'] = manual_path
-
+        manual_path = resolve_config_path(result_file)
         if not os.path.exists(manual_path):
-            rospy.logwarn_once(f"Manual calibration file {manual_path} does not exist")
-            report['load_error'] = 'file_not_found'
+            rospy.logwarn_once(f'Manual calibration file {manual_path} not found')
             return
 
         try:
-            with open(manual_path, 'r') as f:
-                manual_data = yaml.safe_load(f) or {}
-        except Exception as exc:
-            rospy.logwarn(f"Failed to load manual calibration file {manual_path}: {exc}")
-            report['load_error'] = str(exc)
+            with open(manual_path, 'r') as stream:
+                manual_data = yaml.safe_load(stream) or {}
+        except Exception as exc:  # pragma: no cover - defensive logging
+            rospy.logwarn(f'Failed to load manual calibration file {manual_path}: {exc}')
             return
 
-        report['source'] = manual_data
-
-        apply_extrinsics = bool(manual_cfg.get('apply_extrinsics', True))
-        apply_bias = bool(manual_cfg.get('apply_bias', True))
-        apply_limits = bool(manual_cfg.get('apply_code_limits', True))
-        match_by_name = bool(manual_cfg.get('match_by_name', True))
-        fallback_to_id = bool(manual_cfg.get('fallback_to_id', True))
-
-        galvo_entries = self.params.get('galvos')
-        if not isinstance(galvo_entries, list):
-            galvo_entries = []
-            self.params['galvos'] = galvo_entries
-
-        manual_galvos = manual_data.get('galvos', []) if isinstance(manual_data, dict) else []
-        if not manual_galvos:
-            rospy.logwarn_once(f"Manual calibration file {manual_path} does not contain galvo entries")
-            report['load_error'] = 'no_galvo_entries'
+        galvos = params.setdefault('galvos', [])
+        overrides = manual_data.get('galvos', []) if isinstance(manual_data, dict) else []
+        if not isinstance(overrides, list) or not overrides:
+            rospy.logwarn_once('Manual calibration file does not contain galvos list')
             return
 
-        for entry in manual_galvos:
-            if not isinstance(entry, dict):
+        apply_extr = bool(cfg.get('apply_extrinsics', True))
+        apply_bias = bool(cfg.get('apply_bias', True))
+        apply_limits = bool(cfg.get('apply_code_limits', True))
+        match_by_name = bool(cfg.get('match_by_name', True))
+        fallback_to_id = bool(cfg.get('fallback_to_id', True))
+
+        name_to_index = {
+            entry.get('name', f'galvo_{idx}'): idx
+            for idx, entry in enumerate(galvos)
+            if isinstance(entry, dict)
+        }
+
+        for override in overrides:
+            if not isinstance(override, dict):
                 continue
 
-            entry_name = entry.get('name')
-            entry_id = entry.get('id')
-            target_index = None
-            target_entry = None
-
-            if match_by_name and entry_name:
-                for idx, existing in enumerate(galvo_entries):
-                    if isinstance(existing, dict) and existing.get('name') == entry_name:
-                        target_index = idx
-                        target_entry = existing
-                        break
-
-            if target_entry is None and fallback_to_id and entry_id is not None:
+            idx: Optional[int] = None
+            name = override.get('name')
+            if match_by_name and name in name_to_index:
+                idx = name_to_index[name]
+            elif fallback_to_id:
                 try:
-                    candidate = int(entry_id)
+                    candidate = int(override.get('id'))
                 except (TypeError, ValueError):
                     candidate = None
-                if candidate is not None and 0 <= candidate < len(galvo_entries):
-                    target_index = candidate
-                    target_entry = galvo_entries[candidate]
+                if candidate is not None and 0 <= candidate < len(galvos):
+                    idx = candidate
 
-            if target_entry is None:
-                galvo_entries.append({})
-                target_index = len(galvo_entries) - 1
-                target_entry = galvo_entries[target_index]
-                if entry_name:
-                    target_entry['name'] = entry_name
+            if idx is None:
+                idx = len(galvos)
+                galvos.append({'name': name or f'galvo_{idx}'})
+                name_to_index[galvos[idx]['name']] = idx
 
-            extr_applied = False
-            bias_applied = False
-            limit_applied = False
-
-            if apply_extrinsics and isinstance(entry.get('extrinsics'), dict):
-                extr_source = entry['extrinsics']
-                extr_target = target_entry.setdefault('extrinsics', {})
-
-                if 't_gc_mm' in extr_source:
-                    extr_target['t_gc_mm'] = [float(v) for v in extr_source['t_gc_mm']]
-                    extr_applied = True
-                elif 't_gc' in extr_source:
-                    extr_target['t_gc_mm'] = [float(v) for v in extr_source['t_gc']]
-                    extr_applied = True
-
-                if 'R_gc' in extr_source:
-                    extr_target['R_gc'] = [[float(value) for value in row] for row in extr_source['R_gc']]
-                    extr_applied = True
-
-                if 'q_gc_xyzw' in extr_source:
-                    extr_target['q_gc_xyzw'] = [float(v) for v in extr_source['q_gc_xyzw']]
-                    extr_applied = True
-                elif 'q_gc' in extr_source:
-                    extr_target['q_gc'] = [float(v) for v in extr_source['q_gc']]
-                    extr_applied = True
+            entry = galvos[idx]
+            if apply_extr and isinstance(override.get('extrinsics'), dict):
+                entry.setdefault('extrinsics', {}).update(override['extrinsics'])
 
             if apply_bias:
-                manual_info = entry.get('manual_calibration')
-                target_params = target_entry.setdefault('galvo_params', {})
+                manual_info = override.get('manual_calibration', {})
+                updated = manual_info.get('updated_galvo_params', {}) if isinstance(manual_info, dict) else {}
+                entry.setdefault('galvo_params', {}).update(updated)
+                angle_bias = manual_info.get('angle_bias', {}) if isinstance(manual_info, dict) else {}
+                for key in ('bias_x', 'bias_y'):
+                    if key in angle_bias:
+                        entry.setdefault('galvo_params', {})[key] = angle_bias[key]
 
-                if isinstance(manual_info, dict):
-                    angle_bias = manual_info.get('angle_bias', {}) or {}
-                    for axis_key in ('bias_x', 'bias_y'):
-                        if axis_key in angle_bias:
-                            try:
-                                target_params[axis_key] = float(angle_bias[axis_key])
-                            except (TypeError, ValueError):
-                                target_params[axis_key] = angle_bias[axis_key]
-                            bias_applied = True
+            if apply_limits and isinstance(override.get('code_limits'), dict):
+                entry['code_limits'] = override['code_limits']
 
-                    updated_params = manual_info.get('updated_galvo_params', {}) or {}
-                    for key, value in updated_params.items():
-                        if value is None:
-                            continue
-                        try:
-                            target_params[key] = float(value)
-                        except (TypeError, ValueError):
-                            target_params[key] = value
-                        bias_applied = True
+    # ------------------------------------------------------------------
+    # Profile construction
+    # ------------------------------------------------------------------
 
-                angle_bias_entry = entry.get('angle_bias') or {}
-                if isinstance(angle_bias_entry, dict):
-                    for axis_key in ('bias_x', 'bias_y'):
-                        if axis_key in angle_bias_entry:
-                            try:
-                                target_params[axis_key] = float(angle_bias_entry[axis_key])
-                            except (TypeError, ValueError):
-                                target_params[axis_key] = angle_bias_entry[axis_key]
-                            bias_applied = True
+    def _build_camera_model(self) -> None:
+        cam = self.params.get('camera_matrix', {})
+        fx = float(cam.get('fx', 500.0))
+        fy = float(cam.get('fy', 500.0))
+        cx = float(cam.get('cx', 320.0))
+        cy = float(cam.get('cy', 240.0))
 
-            if apply_limits and isinstance(entry.get('code_limits'), dict):
-                target_entry['code_limits'] = entry['code_limits']
-                limit_applied = True
+        self.K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        self.D = np.array(self.params.get('distortion_coeffs', []), dtype=np.float64)
+        self.use_distortion = bool(len(self.D))
 
-            profile_summary = {
-                'index': target_index,
-                'name': target_entry.get('name', f'galvo_{target_index}'),
-                'applied_extrinsics': extr_applied,
-                'applied_bias': bias_applied,
-                'applied_limits': limit_applied,
-            }
+    def _build_work_plane(self) -> None:
+        plane = self.params.get('work_plane', {})
+        n_g = np.array(plane.get('n_g', [0.0, 0.0, 1.0]), dtype=np.float64)
+        norm = np.linalg.norm(n_g)
+        self.n_g = n_g / norm if norm > 1e-9 else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        self.d_g = float(plane.get('d_g', -1000.0))
 
-            validation = entry.get('validation')
-            if isinstance(validation, dict):
-                profile_summary['validation'] = {
-                    'rmse_total_mm': validation.get('rmse_total_mm'),
-                    'max_error_mm': validation.get('max_error_mm'),
-                    'mean_error_mm': validation.get('mean_error_mm'),
-                }
+    def _combine_galvo_params(self, overrides: Optional[Dict[str, float]]) -> Dict[str, float]:
+        params = dict(self.params.get('galvo_params', {}))
+        if isinstance(overrides, dict):
+            params.update(overrides)
+        return params
 
-                rmse_val = validation.get('rmse_total_mm')
-                max_val = validation.get('max_error_mm')
-                if rmse_val is not None and max_val is not None:
-                    try:
-                        rospy.loginfo(
-                            f"Manual calibration residuals for {profile_summary['name']}: "
-                            f"RMSE={float(rmse_val):.2f} mm, Max={float(max_val):.2f} mm"
-                        )
-                    except (TypeError, ValueError):
-                        pass
+    @staticmethod
+    def _parse_translation(source: Dict[str, object], fallback: Dict[str, object]) -> np.ndarray:
+        if 't_gc_mm' in source:
+            values = source['t_gc_mm']
+        elif 't_gc' in source:
+            values = source['t_gc']
+        else:
+            values = fallback.get('t_gc_mm', fallback.get('t_gc', [0.0, 0.0, 0.0]))
+        return np.array([float(v) for v in values], dtype=np.float64)
 
-            report['profiles'].append(profile_summary)
+    @staticmethod
+    def _parse_rotation(source: Dict[str, object], fallback: Dict[str, object]) -> Rotation:
+        if 'R_gc' in source:
+            return Rotation.from_matrix(np.array(source['R_gc'], dtype=np.float64))
 
-            if extr_applied or bias_applied or limit_applied:
-                report['applied'] = True
-                rospy.loginfo(
-                    f"Applied manual calibration overrides to galvo '{profile_summary['name']}' (index {target_index})"
-                )
+        quat = source.get('q_gc_xyzw', source.get('q_gc'))
+        if quat is None:
+            quat = fallback.get('q_gc_xyzw', fallback.get('q_gc', [0.0, 0.0, 0.0, 1.0]))
+        quat = np.array(quat, dtype=np.float64)
+        if quat.shape != (4,) or not np.isfinite(quat).all():
+            quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        norm = np.linalg.norm(quat)
+        if norm < 1e-9:
+            quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        else:
+            quat = quat / norm
+        return Rotation.from_quat(quat)
 
-        if not report['applied']:
-            rospy.logwarn_once(
-                f"Manual calibration file {manual_path} did not apply any overrides."
-            )
+    @staticmethod
+    def _parse_code_limits(limits: Optional[Dict[str, List[float]]], default_max: float) -> np.ndarray:
+        if isinstance(limits, dict):
+            x_lim = limits.get('x', [-default_max, default_max])
+            y_lim = limits.get('y', [-default_max, default_max])
+        else:
+            x_lim = [-default_max, default_max]
+            y_lim = [-default_max, default_max]
+        arr = np.array([x_lim, y_lim], dtype=np.float64)
+        arr[:, 0] = np.minimum(arr[:, 0], arr[:, 1])
+        return arr
 
-    def _compute_axis_angle_limits(self, galvo_params: Dict[str, object]) -> Dict[str, float]:
-        galvo = galvo_params or {}
-        default_total = galvo.get('scan_angle', self.default_params['galvo_params']['scan_angle'])
-        try:
-            default_half = float(default_total) / 2.0
-        except (TypeError, ValueError):
-            default_half = float(self.default_params['galvo_params']['scan_angle']) / 2.0
+    def _compute_axis_limits(self, galvo_params: Dict[str, float]) -> Dict[str, float]:
+        total = float(galvo_params.get('scan_angle', self.DEFAULT_PARAMS['galvo_params']['scan_angle']))
+        half = total / 2.0 if total > 0 else self.DEFAULT_PARAMS['galvo_params']['scan_angle'] / 2.0
 
-        if default_half <= 0:
-            default_half = float(self.default_params['galvo_params']['scan_angle']) / 2.0
-
-        def resolve(key: str, label: str) -> float:
-            value = galvo.get(key, None)
-            if value is None:
-                return default_half
+        def pick(key: str) -> float:
             try:
-                numeric = float(value)
+                value = float(galvo_params.get(key, half))
             except (TypeError, ValueError):
-                rospy.logwarn_once(
-                    f"Invalid {label}={value} in galvo_params, falling back to {default_half:.3f}°"
-                )
-                return default_half
-
-            if numeric <= 0:
-                rospy.logwarn_once(
-                    f"Non-positive {label}={numeric} in galvo_params, using {default_half:.3f}°"
-                )
-                return default_half
-
-            return numeric
+                value = half
+            return value if value > 0 else half
 
         return {
-            'x_plus': resolve('scan_angle_x_plus', 'scan_angle_x_plus'),
-            'x_minus': resolve('scan_angle_x_minus', 'scan_angle_x_minus'),
-            'y_plus': resolve('scan_angle_y_plus', 'scan_angle_y_plus'),
-            'y_minus': resolve('scan_angle_y_minus', 'scan_angle_y_minus'),
+            'x_plus': pick('scan_angle_x_plus'),
+            'x_minus': pick('scan_angle_x_minus'),
+            'y_plus': pick('scan_angle_y_plus'),
+            'y_minus': pick('scan_angle_y_minus'),
         }
 
-    def _update_axis_angle_limits(self) -> None:
-        self.axis_angle_limits = self._compute_axis_angle_limits(self.params.get('galvo_params', {}))
+    def _build_galvo_profiles(self) -> None:
+        self._galvo_profiles: List[GalvoHeadProfile] = []
 
-    def get_axis_angle_limits(self, index: Optional[int] = None) -> Dict[str, float]:
-        """Return the galvo scan angle limits (degrees)."""
+        galvos = self.params.get('galvos') or [{}]
+        if not isinstance(galvos, list):
+            galvos = [{}]
+            self.params['galvos'] = galvos
 
-        if index is None:
-            return dict(self.axis_angle_limits)
+        base_extrinsics = self.params.get('extrinsics', {})
 
-        profile = self._get_profile(index)
-        return dict(profile.axis_angle_limits)
-
-    def get_galvo_params(self, index: Optional[int] = None) -> Dict[str, float]:
-        """Return the galvo parameter dictionary for the requested head."""
-
-        if index is None:
-            return dict(self.active_galvo_params)
-
-        profile = self._get_profile(index)
-        return dict(profile.galvo_params)
-
-    def enable_mech_compensation(self, enabled: bool):
-        self.use_mech_compensation = bool(enabled)
-        rospy.loginfo(f"Mechanical compensation set to: {self.use_mech_compensation}")
-
-    def set_galvo_compensation_params(self, **kwargs):
-        for k, v in kwargs.items():
-            if hasattr(self.galvo_lin, k):
-                setattr(self.galvo_lin, k, float(v))
-        rospy.loginfo(f"Updated mechanical compensation params: {self.galvo_lin}")
-
-    def init_3d_transform(self):
-        try:
-            self.build_camera_matrix()
-            self.build_extrinsics()
-            self.build_work_plane()
-            self.transform_3d_initialized = True
-        except Exception as e:
-            rospy.logerr(f"Failed to initialize 3D transform components: {e}")
-            self.transform_3d_initialized = False
-
-    def _load_galvo_profiles(self):
-        self._galvo_profiles = []
-
-        galvo_entries = self.params.get('galvos', []) or []
-        default_max_code = float(self.params.get('galvo_params', {}).get('max_code', 32767))
-
-        if not galvo_entries:
-            profile = GalvoHeadProfile(
-                index=0,
-                name='galvo_0',
-                t_gc=np.array(self.t_gc, dtype=np.float64),
-                R_gc=np.array(self.R_gc, dtype=np.float64),
-                q_gc=Rotation.from_matrix(self.R_gc).as_quat(),
-                code_offset=np.zeros(2, dtype=np.float64),
-                code_scale=np.ones(2, dtype=np.float64),
-                max_code=default_max_code,
-                code_limits=np.array([
-                    [-default_max_code, default_max_code],
-                    [-default_max_code, default_max_code]
-                ], dtype=np.float64),
-                galvo_params=dict(self.params.get('galvo_params', {})),
-                axis_angle_limits=self._compute_axis_angle_limits(self.params.get('galvo_params', {}))
-            )
-            self._galvo_profiles.append(profile)
-            return
-
-        for idx, entry in enumerate(galvo_entries):
+        for idx, entry in enumerate(galvos):
+            entry = entry or {}
             name = entry.get('name', f'galvo_{idx}')
-            extrinsics = entry.get('extrinsics', {}) or {}
+            extr = entry.get('extrinsics', {}) if isinstance(entry, dict) else {}
+            galvo_params = self._combine_galvo_params(entry.get('galvo_params'))
+            rotation = self._parse_rotation(extr, base_extrinsics)
+            R_gc = rotation.as_matrix()
+            q_gc = rotation.as_quat()
+            t_gc = self._parse_translation(extr, base_extrinsics)
 
-            t_gc = np.array(
-                extrinsics.get('t_gc_mm', extrinsics.get('t_gc', self.t_gc)),
-                dtype=np.float64
-            )
-
-            if 'R_gc' in extrinsics:
-                R_gc = np.array(extrinsics['R_gc'], dtype=np.float64)
-                q_gc = Rotation.from_matrix(R_gc).as_quat()
-            elif 'q_gc_xyzw' in extrinsics:
-                q_gc = np.array(extrinsics['q_gc_xyzw'], dtype=np.float64)
-                R_gc = Rotation.from_quat(q_gc).as_matrix()
-            elif 'q_gc' in extrinsics:
-                q_gc = np.array(extrinsics['q_gc'], dtype=np.float64)
-                R_gc = Rotation.from_quat(q_gc).as_matrix()
-            else:
-                R_gc = np.array(self.R_gc, dtype=np.float64)
-                q_gc = Rotation.from_matrix(R_gc).as_quat()
-
-            code_offset = np.array(
-                entry.get('code_offset', [0.0, 0.0]),
-                dtype=np.float64
-            )
-            code_scale = np.array(
-                entry.get('code_scale', [1.0, 1.0]),
-                dtype=np.float64
-            )
-
-            entry_params = entry.get('galvo_params', {}) or {}
-            # allow direct shorthand fields inside the galvo entry
-            for key in ('scan_angle', 'scan_angle_x_plus', 'scan_angle_x_minus',
-                        'scan_angle_y_plus', 'scan_angle_y_minus',
-                        'scale_x', 'scale_y', 'bias_x', 'bias_y', 'max_code'):
-                if key in entry and key not in entry_params:
-                    entry_params[key] = entry[key]
-
-            profile_galvo_params = dict(self.params.get('galvo_params', {}))
-            for key, value in entry_params.items():
-                try:
-                    profile_galvo_params[key] = float(value)
-                except (TypeError, ValueError):
-                    profile_galvo_params[key] = value
-
-            profile_max_code = float(profile_galvo_params.get('max_code', entry.get('max_code', default_max_code)))
-            limits_entry = entry.get('code_limits', {}) or {}
-            if isinstance(limits_entry, dict):
-                x_limits = limits_entry.get('x', [-profile_max_code, profile_max_code])
-                y_limits = limits_entry.get('y', [-profile_max_code, profile_max_code])
-            elif isinstance(limits_entry, list) and len(limits_entry) == 2:
-                x_limits, y_limits = limits_entry
-            else:
-                x_limits = [-profile_max_code, profile_max_code]
-                y_limits = [-profile_max_code, profile_max_code]
-
-            code_limits = np.array([
-                [float(x_limits[0]), float(x_limits[1])],
-                [float(y_limits[0]), float(y_limits[1])]
-            ], dtype=np.float64)
-
-            profile_axis_limits = self._compute_axis_angle_limits(profile_galvo_params)
+            code_offset = np.array(entry.get('code_offset', [0.0, 0.0]), dtype=np.float64)
+            code_scale = np.array(entry.get('code_scale', [1.0, 1.0]), dtype=np.float64)
+            max_code = float(entry.get('max_code', galvo_params.get('max_code', 32767)))
+            code_limits = self._parse_code_limits(entry.get('code_limits'), max_code)
+            axis_limits = self._compute_axis_limits(galvo_params)
 
             profile = GalvoHeadProfile(
                 index=idx,
@@ -632,61 +362,57 @@ class CameraGalvoTransform:
                 q_gc=q_gc,
                 code_offset=code_offset,
                 code_scale=code_scale,
-                max_code=profile_max_code,
+                max_code=max_code,
                 code_limits=code_limits,
-                galvo_params=profile_galvo_params,
-                axis_angle_limits=profile_axis_limits
+                galvo_params=galvo_params,
+                axis_angle_limits=axis_limits,
             )
             self._galvo_profiles.append(profile)
-            try:
-                self.params.setdefault('galvos', [])[idx]['galvo_params'] = dict(profile_galvo_params)
-            except Exception:
-                pass
 
-    def set_active_galvo_profile(self, index: int):
-        if not self._galvo_profiles:
-            return
-
-        if index < 0 or index >= len(self._galvo_profiles):
-            rospy.logwarn_once(
-                f"Requested galvo profile {index} out of range, using profile 0"
-            )
-            index = 0
-
-        profile = self._galvo_profiles[index]
-        self.t_gc = np.array(profile.t_gc, dtype=np.float64)
-        self.R_gc = np.array(profile.R_gc, dtype=np.float64)
-        self.q_gc = np.array(profile.q_gc, dtype=np.float64)
-        self.active_profile_index = index
-        self.active_profile_limits = np.array(profile.code_limits, dtype=np.float64)
-        self.active_profile_max_code = float(profile.max_code)
-        self.active_profile_scale = np.array(profile.code_scale, dtype=np.float64)
-        self.active_profile_offset = np.array(profile.code_offset, dtype=np.float64)
-        self.active_galvo_params = dict(profile.galvo_params)
-        self.axis_angle_limits = dict(profile.axis_angle_limits)
+    # ------------------------------------------------------------------
+    # Profile accessors
+    # ------------------------------------------------------------------
 
     def _get_profile(self, index: int) -> GalvoHeadProfile:
         if not self._galvo_profiles:
-            raise RuntimeError("Galvo profiles have not been initialized")
-
+            raise RuntimeError('Galvo profiles not initialised')
+        index = int(index)
         if index < 0 or index >= len(self._galvo_profiles):
-            rospy.logwarn_once(
-                f"Galvo profile index {index} is invalid, falling back to profile 0"
-            )
-            return self._galvo_profiles[0]
-
+            raise IndexError(f'Galvo index {index} out of range')
         return self._galvo_profiles[index]
+
+    def set_active_galvo_profile(self, index: int) -> None:
+        profile = self._get_profile(index)
+        self.active_profile_index = profile.index
+        self.active_profile = profile
+        self.active_profile_max_code = float(profile.max_code)
+        self.active_profile_offset = profile.code_offset.copy()
+        self.active_profile_scale = profile.code_scale.copy()
+        self.active_galvo_params = dict(profile.galvo_params)
+        self.axis_angle_limits = dict(profile.axis_angle_limits)
+
+        self.t_gc = profile.t_gc.copy()
+        self.R_gc = profile.R_gc.copy()
+        self.q_gc = profile.q_gc.copy()
 
     def get_galvo_profile_count(self) -> int:
         return len(self._galvo_profiles)
 
     def get_code_limits(self, index: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         profile = self._get_profile(index)
-        limits = np.array(profile.code_limits, dtype=np.float64)
+        limits = profile.code_limits
         return (
             (int(round(limits[0, 0])), int(round(limits[0, 1]))),
-            (int(round(limits[1, 0])), int(round(limits[1, 1])))
+            (int(round(limits[1, 0])), int(round(limits[1, 1]))),
         )
+
+    def get_galvo_params(self, index: Optional[int] = None) -> Dict[str, float]:
+        profile = self._get_profile(index if index is not None else self.active_profile_index)
+        return dict(profile.galvo_params)
+
+    def get_axis_angle_limits(self, index: Optional[int] = None) -> Dict[str, float]:
+        profile = self._get_profile(index if index is not None else self.active_profile_index)
+        return dict(profile.axis_angle_limits)
 
     def get_profile_metadata(self, index: int) -> Dict[str, object]:
         profile = self._get_profile(index)
@@ -701,646 +427,314 @@ class CameraGalvoTransform:
             'code_limits': profile.code_limits.tolist(),
             'max_code': profile.max_code,
             'galvo_params': dict(profile.galvo_params),
-            'axis_angle_limits': dict(profile.axis_angle_limits)
+            'axis_angle_limits': dict(profile.axis_angle_limits),
         }
 
     def list_galvo_profiles(self) -> List[Dict[str, object]]:
         return [self.get_profile_metadata(idx) for idx in range(len(self._galvo_profiles))]
 
-    def get_manual_calibration_report(self) -> Dict[str, object]:
-        if self.manual_calibration_report is None:
-            return {}
+    # ------------------------------------------------------------------
+    # Depth helpers
+    # ------------------------------------------------------------------
 
-        return copy.deepcopy(self.manual_calibration_report)
-
-    def _apply_profile_adjustments(self, codes, profile: Optional[GalvoHeadProfile]):
-        if profile is None:
-            return int(codes[0]), int(codes[1])
-
-        adjusted = np.array(codes, dtype=np.float64) * profile.code_scale + profile.code_offset
-        if profile.code_limits is not None:
-            adjusted[0] = np.clip(adjusted[0], profile.code_limits[0, 0], profile.code_limits[0, 1])
-            adjusted[1] = np.clip(adjusted[1], profile.code_limits[1, 0], profile.code_limits[1, 1])
-        return int(round(adjusted[0])), int(round(adjusted[1]))
-
-    def init_simple_mapping(self):
-        simple = self.params['simple_mapping']
-        self.simple_use_safe_range = simple['use_safe_range']
-        self.simple_max_safe_range = simple['max_safe_range']
-        self.simple_protocol_max = simple['protocol_max']
-        self.simple_scale_factor = simple['scale_factor']
-        self.simple_offset_x = simple['offset_x']
-        self.simple_offset_y = simple['offset_y']
-
-    def build_camera_matrix(self):
-        cam = self.params['camera_matrix']
-        self.K = np.array([
-            [cam['fx'], 0, cam['cx']],
-            [0, cam['fy'], cam['cy']],
-            [0, 0, 1]
-        ], dtype=np.float64)
-
-        self.D = np.array(self.params['distortion_coeffs'], dtype=np.float64)
-        self.use_distortion = len(self.D) > 0
-
-    def build_extrinsics(self):
-        ext = self.params['extrinsics']
-        self.t_gc = np.array(ext['t_gc'], dtype=np.float64)
-        q = ext['q_gc']  # [x, y, z, w]
-        self.R_gc = Rotation.from_quat(q).as_matrix()
-        # 约定：p_g = R_gc * p_c + t_gc
-
-    def build_work_plane(self):
-        plane = self.params['work_plane']
-        self.n_g = np.array(plane['n_g'], dtype=np.float64)
-        self.n_g = self.n_g / np.linalg.norm(self.n_g)
-        self.d_g = float(plane['d_g'])
-
-    # -------------------- 公共 API --------------------
-
-    def set_depth_query(self, func):
-        """
-        设置像素深度查询回调。
-        func(u, v) -> depth_in_meters or None
-        """
+    def set_depth_query(self, func) -> None:
         self.depth_query_func = func
 
-    def set_fixed_depth_for_reverse(self, z_mm):
-        """
-        设置反向回投时的固定深度面（振镜坐标系 z = z_mm）。
-        若设为 None，则不使用固定深度优先级。
-        """
+    def set_fixed_depth_for_reverse(self, z_mm: Optional[float]) -> None:
         self.fixed_reverse_depth_z_mm = z_mm
+
+    # ------------------------------------------------------------------
+    # Forward transform: pixel → galvo codes
+    # ------------------------------------------------------------------
 
     def pixel_to_galvo_code(
         self,
-        pixel_x,
-        pixel_y,
-        image_width=640,
-        image_height=480,
-        galvo_index: int = 0
-    ):
+        pixel_x: float,
+        pixel_y: float,
+        image_width: int = 640,
+        image_height: int = 480,
+        galvo_index: int = 0,
+    ) -> Optional[Tuple[int, int]]:
+        profile = self._get_profile(galvo_index)
+        if profile.index != getattr(self, 'active_profile_index', None):
+            self.set_active_galvo_profile(profile.index)
 
         try:
-            profile = self._get_profile(galvo_index)
-            if self.active_profile_index != profile.index:
-                self.set_active_galvo_profile(profile.index)
-
-            # pixel_x = 640
-            # pixel_y = 407  # 407
-            if self.use_3d_transform and getattr(self, 'transform_3d_initialized', False):
-
-                result = self.pixel_to_galvo_3d(pixel_x, pixel_y, image_width, image_height)
-                if result is not None:
-                    self.transform_method_used = "3D geometric transform"
-                    self.transform_valid = True
-                    self.transform_fail_count = 0
-                    return self._apply_profile_adjustments(result, profile)
-                else:
-                    # self.transform_fail_count += 1
-                    # if self.transform_fail_count <= 5:
-                    #     rospy.logwarn(f"3D transform failed (count: {self.transform_fail_count}), trying fallback")
-
-                    if self.params['transform_mode']['fallback_to_simple']:
-                        result = self.pixel_to_galvo_simple(pixel_x, pixel_y, image_width, image_height)
-                        self.transform_method_used = "Simple mapping (fallback)"
-                        self.transform_valid = True
-                        return self._apply_profile_adjustments(result, profile)
-                    else:
-                        self.transform_valid = False
-                        return None
+            if self.use_3d_transform:
+                result = self._pixel_to_galvo_3d(pixel_x, pixel_y)
+                method = '3D geometric transform'
             else:
-                result = self.pixel_to_galvo_simple(pixel_x, pixel_y, image_width, image_height)
-                self.transform_method_used = "Simple mapping"
-                self.transform_valid = True
-                return self._apply_profile_adjustments(result, profile)
+                result = self._pixel_to_galvo_simple(pixel_x, pixel_y, image_width, image_height)
+                method = 'Simple mapping'
+        except Exception as exc:  # pragma: no cover - defensive path
+            rospy.logdebug(f'pixel_to_galvo_code failed, fallback to simple mapping: {exc}')
+            result = self._pixel_to_galvo_simple(pixel_x, pixel_y, image_width, image_height)
+            method = 'Simple mapping'
 
-        except Exception as e:
-            rospy.logerr(f"Coordinate transform failed: {e}")
-            self.transform_valid = False
-            try:
-                result = self.pixel_to_galvo_simple(pixel_x, pixel_y, image_width, image_height)
-                self.transform_method_used = "Simple mapping (exception fallback)"
-                self.transform_valid = True
-                profile = self._get_profile(galvo_index)
-                return self._apply_profile_adjustments(result, profile)
-            except:
+        self.transform_method_used = method
+        self.transform_valid = result is not None
+        return result
+
+    def _pixel_to_galvo_simple(self, pixel_x: float, pixel_y: float, image_width: int, image_height: int) -> Tuple[int, int]:
+        mapping = self.params.get('simple_mapping', {})
+        use_safe = bool(mapping.get('use_safe_range', True))
+        max_range = float(mapping.get('max_safe_range' if use_safe else 'protocol_max', 32767))
+        offset_x = float(mapping.get('offset_x', 0.0))
+        offset_y = float(mapping.get('offset_y', 0.0))
+
+        norm_x = pixel_x / float(image_width) - 0.5
+        norm_y = pixel_y / float(image_height) - 0.5
+        scale = max_range * 2.0
+
+        galvo_x = np.clip(norm_x * scale + offset_x, -max_range, max_range)
+        galvo_y = np.clip(norm_y * scale + offset_y, -max_range, max_range)
+
+        codes = (int(round(galvo_x)), int(round(galvo_y)))
+        self.last_pixel_pos = (pixel_x, pixel_y)
+        self.last_galvo_pos = codes
+        return codes
+
+    def _pixel_to_galvo_3d(self, pixel_x: float, pixel_y: float) -> Optional[Tuple[int, int]]:
+        depth = None
+        if callable(self.depth_query_func):
+            depth = self.depth_query_func(pixel_x, pixel_y)
+        point_g = None
+        if depth and depth > 0:
+            point_g = self.pixel_depth_to_point_galvo(pixel_x, pixel_y, depth)
+        if point_g is None:
+            ray_dir_cam = self._camera_ray_from_pixel(pixel_x, pixel_y)
+            if ray_dir_cam is None:
                 return None
-
-    def galvo_code_to_pixel(self, galvo_x, galvo_y, image_width=640, image_height=480):
-        try:
-            if self.use_3d_transform and getattr(self, 'transform_3d_initialized', False):
-                return self.galvo_code_to_pixel_3d(galvo_x, galvo_y, image_width, image_height)
-            else:
-                return self.galvo_code_to_pixel_simple(galvo_x, galvo_y, image_width, image_height)
-
-        except Exception as e:
-            rospy.logdebug(f"Reverse coordinate transform failed: {e}")
-            return self.galvo_code_to_pixel_simple(galvo_x, galvo_y, image_width, image_height)
-
-    # -------------------- 正向 3D --------------------
-
-    def pixel_depth_to_point_galvo(self, pixel_x, pixel_y, depth_m):
-        """
-        像素坐标-相机坐标-振镜坐标
-        """
-        try:
-            if depth_m is None or depth_m <= 0:
-                return None
-            # print("K",self.K)
-            x_c = (pixel_x - self.K[0, 2]) / self.K[0, 0] * depth_m
-            y_c = (pixel_y - self.K[1, 2]) / self.K[1, 1] * depth_m
-            z_c = depth_m
-            p_c_mm = np.array([x_c * 1000.0, y_c * 1000.0, z_c * 1000.0], dtype=np.float64)
-            # print("p_c_mm:", p_c_mm)
-            p_g = self.R_gc @ p_c_mm + self.t_gc
-            # print("p_g:", p_g)
-            return p_g
-        except Exception:
+            ray_origin_g = self.t_gc
+            ray_dir_g = self.R_gc @ ray_dir_cam
+            point_g = self._ray_plane_intersection(ray_origin_g, ray_dir_g)
+        if point_g is None:
             return None
 
-    def pixel_to_camera_ray(self, pixel_x, pixel_y):
+        self.last_hit_point_g = point_g.copy()
+        theta_x, theta_y = self._angles_from_point(point_g)
+        code_x, code_y = self.angles_to_codes(theta_x, theta_y)
+        codes = (int(round(code_x)), int(round(code_y)))
+        self.last_pixel_pos = (pixel_x, pixel_y)
+        self.last_galvo_pos = codes
+        return codes
+
+    def _camera_ray_from_pixel(self, pixel_x: float, pixel_y: float) -> Optional[np.ndarray]:
         try:
-            if self.use_distortion:
-                # 去畸变
-                pass
             x = (pixel_x - self.K[0, 2]) / self.K[0, 0]
             y = (pixel_y - self.K[1, 2]) / self.K[1, 1]
-            ray_dir = np.array([x, y, 1.0], dtype=np.float64)
-            ray_dir = ray_dir / np.linalg.norm(ray_dir)
-            return ray_dir
-        except Exception as e:
-            rospy.logdebug(f"Failed to convert pixel to camera ray: {e}")
+            ray = np.array([x, y, 1.0], dtype=np.float64)
+            norm = np.linalg.norm(ray)
+            return ray / norm if norm > 1e-9 else None
+        except Exception:  # pragma: no cover - defensive path
             return None
 
-    def ray_plane_intersection(self, ray_origin, ray_direction):
-        try:
-            denominator = np.dot(self.n_g, ray_direction)
-            if abs(denominator) < 1e-6:
-                return None
-
-            t = -(np.dot(self.n_g, ray_origin) + self.d_g) / denominator
-            if t <= 0:
-                return None
-
-            intersection = ray_origin + t * ray_direction
-            return intersection
-        except Exception:
+    def _ray_plane_intersection(self, origin: np.ndarray, direction: np.ndarray) -> Optional[np.ndarray]:
+        denom = np.dot(self.n_g, direction)
+        if abs(denom) < 1e-9:
             return None
+        t = -(np.dot(self.n_g, origin) + self.d_g) / denom
+        if t <= 0:
+            return None
+        return origin + t * direction
 
-    def point_to_galvo_angles(self, point):
-        """ 从坐标点计算与振镜的夹角"""
-        x, y, z = point
-        self.reverse_theta_x = np.arctan2(x, z)
-        self.reverse_theta_y = np.arctan2(y, z)
-        if z < 0:
-            x, y, z = x, y, -z
+    def _angles_from_point(self, point_g: np.ndarray) -> Tuple[float, float]:
+        x, y, z = point_g
         if abs(z) < 1e-9:
             return 0.0, 0.0
-        theta_x = np.arctan2(x, z)      #得到弧度
-        theta_y = np.arctan2(y, z)
-        # print("thetax,thetay:",theta_x, theta_y)
-        return theta_x, theta_y
+        return float(np.arctan2(x, z)), float(np.arctan2(y, z))
 
-    @staticmethod
-    def _angle_to_norm(theta_deg: float, negative_limit: float, positive_limit: float) -> float:
-        if theta_deg >= 0.0:
-            denom = positive_limit if positive_limit > 1e-6 else 1.0
+    # ------------------------------------------------------------------
+    # Code ↔ angle conversions
+    # ------------------------------------------------------------------
+
+    def angles_to_codes(self, theta_x: float, theta_y: float) -> Tuple[float, float]:
+        profile = self.active_profile
+        galvo = profile.galvo_params
+        limits = profile.axis_angle_limits
+
+        theta_x_deg = np.degrees(theta_x) * galvo.get('scale_x', 1.0) + galvo.get('bias_x', 0.0)
+        theta_y_deg = np.degrees(theta_y) * galvo.get('scale_y', 1.0) + galvo.get('bias_y', 0.0)
+
+        def to_norm(angle_deg: float, neg_limit: float, pos_limit: float) -> float:
+            limit = pos_limit if angle_deg >= 0 else neg_limit
+            return angle_deg / limit if abs(limit) > 1e-9 else 0.0
+
+        norm_x = to_norm(theta_x_deg, limits['x_minus'], limits['x_plus'])
+        norm_y = to_norm(theta_y_deg, limits['y_minus'], limits['y_plus'])
+
+        base_x = np.clip(norm_x * profile.max_code, -profile.max_code, profile.max_code)
+        base_y = np.clip(norm_y * profile.max_code, -profile.max_code, profile.max_code)
+
+        code_x = base_x * profile.code_scale[0] + profile.code_offset[0]
+        code_y = base_y * profile.code_scale[1] + profile.code_offset[1]
+
+        code_x = np.clip(code_x, profile.code_limits[0, 0], profile.code_limits[0, 1])
+        code_y = np.clip(code_y, profile.code_limits[1, 0], profile.code_limits[1, 1])
+
+        return float(code_x), float(code_y)
+
+    def codes_to_angles(self, code_x: float, code_y: float) -> Tuple[float, float]:
+        profile = self.active_profile
+        galvo = profile.galvo_params
+        limits = profile.axis_angle_limits
+
+        scale_x = profile.code_scale[0] if abs(profile.code_scale[0]) > 1e-9 else 1.0
+        scale_y = profile.code_scale[1] if abs(profile.code_scale[1]) > 1e-9 else 1.0
+
+        base_x = (code_x - profile.code_offset[0]) / scale_x
+        base_y = (code_y - profile.code_offset[1]) / scale_y
+
+        base_x = np.clip(base_x, -profile.max_code, profile.max_code)
+        base_y = np.clip(base_y, -profile.max_code, profile.max_code)
+
+        norm_x = base_x / profile.max_code if profile.max_code else 0.0
+        norm_y = base_y / profile.max_code if profile.max_code else 0.0
+
+        def from_norm(norm_value: float, neg_limit: float, pos_limit: float) -> float:
+            limit = pos_limit if norm_value >= 0 else neg_limit
+            return norm_value * limit
+
+        angle_x_deg = from_norm(norm_x, limits['x_minus'], limits['x_plus'])
+        angle_y_deg = from_norm(norm_y, limits['y_minus'], limits['y_plus'])
+
+        angle_x_deg = (angle_x_deg - galvo.get('bias_x', 0.0)) / galvo.get('scale_x', 1.0)
+        angle_y_deg = (angle_y_deg - galvo.get('bias_y', 0.0)) / galvo.get('scale_y', 1.0)
+
+        return np.radians(angle_x_deg), np.radians(angle_y_deg)
+
+    # ------------------------------------------------------------------
+    # Reverse transform: galvo codes → pixel
+    # ------------------------------------------------------------------
+
+    def galvo_code_to_pixel(
+        self,
+        galvo_x: float,
+        galvo_y: float,
+        image_width: int = 640,
+        image_height: int = 480,
+    ) -> Optional[Tuple[float, float]]:
+        if self.use_3d_transform:
+            pixel = self._galvo_code_to_pixel_3d(galvo_x, galvo_y)
         else:
-            denom = negative_limit if negative_limit > 1e-6 else 1.0
+            pixel = self.galvo_code_to_pixel_simple(galvo_x, galvo_y, image_width, image_height)
+        return pixel
 
-        return theta_deg / denom if abs(denom) > 1e-6 else 0.0
-
-    @staticmethod
-    def _norm_to_angle(norm_value: float, negative_limit: float, positive_limit: float) -> float:
-        if norm_value >= 0.0:
-            return norm_value * (positive_limit if positive_limit > 1e-6 else 1.0)
-
-        return norm_value * (negative_limit if negative_limit > 1e-6 else 1.0)
-
-    def angles_to_codes(self, theta_x, theta_y):
-        """
-        角度转成振镜编码，xy2-100形式
-        """
-        galvo = self.active_galvo_params
-        profile = self._get_profile(self.active_profile_index)
-        theta_x_deg = np.degrees(theta_x)   #弧度转角度
-        theta_y_deg = np.degrees(theta_y)
-        # print("theta_x_deg,theta_y_deg ",theta_x_deg,theta_y_deg)
-        theta_x_corrected = theta_x_deg * galvo['scale_x'] + galvo['bias_x']    #应用修正
-        theta_y_corrected = theta_y_deg * galvo['scale_y'] + galvo['bias_y']
-        # print("theta_x_deg,theta_y_deg:", theta_x_corrected,theta_y_corrected)
-
-        limits = self.axis_angle_limits
-
-        norm_x = self._angle_to_norm(theta_x_corrected, limits['x_minus'], limits['x_plus'])
-        norm_y = self._angle_to_norm(theta_y_corrected, limits['y_minus'], limits['y_plus'])
-
-        max_code = float(profile.max_code)
-        base_code_x = norm_x * max_code
-        base_code_y = norm_y * max_code
-
-        saturated = (abs(base_code_x) > max_code) or (abs(base_code_y) > max_code)
-        if saturated:
-            rospy.logwarn_throttle(1.0, "angles_to_codes saturated; visualization/roundtrip may be inaccurate")
-
-        base_code_x = np.clip(base_code_x, -max_code, max_code)
-        base_code_y = np.clip(base_code_y, -max_code, max_code)
-
-        adjusted = np.array([base_code_x, base_code_y], dtype=np.float64)
-        adjusted = adjusted * profile.code_scale + profile.code_offset
-        if profile.code_limits is not None:
-            adjusted[0] = np.clip(adjusted[0], profile.code_limits[0, 0], profile.code_limits[0, 1])
-            adjusted[1] = np.clip(adjusted[1], profile.code_limits[1, 0], profile.code_limits[1, 1])
-
-        return adjusted[0], adjusted[1]
-
-    @staticmethod
-    def _angles_yfirst_from_plane(X_mm, Y_mm, Z_mm):
-        # alpha 先（Y/Z），beta 后（X/Z * cos(alpha)）
-        Z = float(Z_mm)
-        alpha = np.arctan2(Y_mm, Z)
-        ca = np.cos(alpha)
-        beta = np.arctan2((X_mm / Z) * ca, 1.0)
-        return alpha, beta
-
-    def angles_to_codes_mech(self, alpha, beta):
-        # [alpha; beta] = [[kx, axy],[ayx, ky]] * ([cx-bx; cy-by])  的反解
-        p = self.galvo_lin
-        A11, A12 = p.kx, p.axy
-        A21, A22 = p.ayx, p.ky
-        det = A11 * A22 - A12 * A21
-        alpha = float(alpha);
-        beta = float(beta)
-
-        if abs(det) < 1e-16:
-            cx = p.bx + beta / (p.ayx if abs(p.ayx) > 1e-16 else -1e-5)
-            cy = p.by + alpha / (p.axy if abs(p.axy) > 1e-16 else -1e-5)
-        else:
-            dcx = (A22 * alpha - A12 * beta) / det
-            dcy = (-A21 * alpha + A11 * beta) / det
-            cx = p.bx + dcx
-            cy = p.by + dcy
-
-        cx = int(np.clip(np.rint(cx), -32767, 32767))
-        cy = int(np.clip(np.rint(cy), -32767, 32767))
-        return cx, cy
-
-
-    def pixel_to_galvo_3d(self, pixel_x, pixel_y, image_width, image_height):
-        try:
-            # 优先使用深度
-            if callable(getattr(self, 'depth_query_func', None)):
-                depth_m = self.depth_query_func(pixel_x, pixel_y)
-                # print(depth_m)
-                if depth_m is not None and depth_m > 0:
-
-                    # depth_m = 0.455 #0.455
-                    point_g = self.pixel_depth_to_point_galvo(pixel_x, pixel_y, depth_m)
-                    # print("pixel x,y,depth",pixel_x,pixel_y,depth_m)
-                    # print("point_g ",point_g)
-                    if point_g is not None:
-                        # 缓存命中点供反向映射使用
-                        self.last_hit_point_g = point_g.copy()
-
-                        if self.use_mech_compensation:
-                            alpha, beta = self._angles_yfirst_from_plane(point_g[0], point_g[1], point_g[2])
-                            theta_y, theta_x = alpha, beta
-                            code_x, code_y = self.angles_to_codes_mech(theta_x, theta_y)
-                        else:
-                            theta_x, theta_y = self.point_to_galvo_angles(point_g)
-                            code_x, code_y = self.angles_to_codes(theta_x, theta_y)
-
-                        self.last_pixel_pos = (pixel_x, pixel_y)
-                        self.last_galvo_pos = (code_x, code_y)
-                        # print("codex,codey",code_x,code_y)
-                        return (int(code_x), int(code_y))
-
-            # 无深度或深度失败，使用给定深度
-            ray_dir_camera = self.pixel_to_camera_ray(pixel_x, pixel_y)
-            if ray_dir_camera is None:
-                return None
-
-            ray_origin_galvo = self.t_gc
-            ray_dir_galvo = self.R_gc @ ray_dir_camera
-
-            intersection_point = self.ray_plane_intersection(ray_origin_galvo, ray_dir_galvo)
-            if intersection_point is None:
-                return None
-
-            self.last_hit_point_g = intersection_point.copy()
-
-            theta_x, theta_y = self.point_to_galvo_angles(intersection_point)
-            code_x, code_y = self.angles_to_codes(theta_x, theta_y)
-
-            self.last_pixel_pos = (pixel_x, pixel_y)
-            self.last_galvo_pos = (code_x, code_y)
-
-            return (int(code_x), int(code_y))
-
-        except Exception as e:
-            rospy.logdebug(f"3D transform exception: {e}")
+    def _galvo_code_to_pixel_3d(self, galvo_x: float, galvo_y: float) -> Optional[Tuple[float, float]]:
+        theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
+        point_g = self._choose_reverse_point(theta_x, theta_y)
+        if point_g is None:
             return None
-
-    def pixel_to_galvo_simple(self, pixel_x, pixel_y, image_width, image_height):
-        norm_x = (pixel_x / image_width - 0.5)
-        norm_y = (pixel_y / image_height - 0.5)
-
-        if self.simple_use_safe_range:
-            max_range = self.simple_max_safe_range
-            scale_factor = max_range * 2
-        else:
-            max_range = self.simple_protocol_max
-            scale_factor = max_range * 2
-
-        galvo_x = norm_x * scale_factor + self.simple_offset_x
-        galvo_y = norm_y * scale_factor + self.simple_offset_y
-
-        galvo_x = max(-max_range, min(max_range, galvo_x))
-        galvo_y = max(-max_range, min(max_range, galvo_y))
-
-        self.last_pixel_pos = (pixel_x, pixel_y)
-        self.last_galvo_pos = (galvo_x, galvo_y)
-
-        return (int(galvo_x), int(galvo_y))
-
-
-    def codes_to_angles(self, code_x, code_y):
-
-        galvo = self.active_galvo_params
-        profile = self._get_profile(self.active_profile_index)
-
-        scale_x = profile.code_scale[0] if profile.code_scale[0] != 0 else 1.0
-        scale_y = profile.code_scale[1] if profile.code_scale[1] != 0 else 1.0
-
-        base_code_x = (code_x - profile.code_offset[0]) / scale_x
-        base_code_y = (code_y - profile.code_offset[1]) / scale_y
-
-        max_code = float(profile.max_code)
-
-        base_code_x = np.clip(base_code_x, -max_code, max_code)
-        base_code_y = np.clip(base_code_y, -max_code, max_code)
-
-        norm_x = base_code_x / max_code
-        norm_y = base_code_y / max_code
-
-        limits = self.axis_angle_limits
-
-        theta_x_corrected = self._norm_to_angle(norm_x, limits['x_minus'], limits['x_plus'])
-        theta_y_corrected = self._norm_to_angle(norm_y, limits['y_minus'], limits['y_plus'])
-
-        theta_x_deg = (theta_x_corrected - galvo['bias_x']) / galvo['scale_x']
-        theta_y_deg = (theta_y_corrected - galvo['bias_y']) / galvo['scale_y']
-
-        theta_x = np.radians(theta_x_deg)
-        theta_y = np.radians(theta_y_deg)
-
-        return theta_x, theta_y
-
-
-    def codes_to_angles_mech(self, cx, cy):
-        # 直接乘矩阵： [alpha; beta] = M * ([cx;cy] - [bx;by])
-        p = self.galvo_lin
-        profile = self._get_profile(self.active_profile_index)
-
-        scale_x = profile.code_scale[0] if profile.code_scale[0] != 0 else 1.0
-        scale_y = profile.code_scale[1] if profile.code_scale[1] != 0 else 1.0
-
-        base_cx = (float(cx) - profile.code_offset[0]) / scale_x
-        base_cy = (float(cy) - profile.code_offset[1]) / scale_y
-
-        v = np.array([base_cx - p.bx, base_cy - p.by], dtype=float)
-        M = np.array([[p.kx, p.axy],
-                      [p.ayx, p.ky]], dtype=float)
-        alpha, beta = (M @ v).tolist()
-        return alpha, beta
-
-    def galvo_angles_to_point_on_plane(self, theta_x, theta_y):
-        """
-        用工作平面求交点。
-        """
-        try:
-            x = np.tan(theta_x)
-            y = np.tan(theta_y)
-            z = 1.0
-            dir_g = np.array([x, y, z], dtype=np.float64)
-            dir_g /= np.linalg.norm(dir_g)
-            org_g = np.zeros(3, dtype=np.float64)
-            return self.ray_plane_intersection(org_g, dir_g)
-        except Exception:
+        camera_point = self._galvo_point_to_camera(point_g)
+        if camera_point is None:
             return None
+        return self._camera_point_to_pixel(camera_point)
 
-    def galvo_angles_to_point_depth_cam(self, theta_x, theta_y, z_ref_mm):
-        # 显式公式：Pg = [-z_ref * tan(ax), -z_ref * tan(ay), z_ref]
+    def _choose_reverse_point(self, theta_x: float, theta_y: float) -> Optional[np.ndarray]:
+        if isinstance(self.last_hit_point_g, np.ndarray):
+            z_ref = float(self.last_hit_point_g[2])
+            return self.galvo_angles_to_point_depth_cam(theta_x, theta_y, z_ref)
+        if self.fixed_reverse_depth_z_mm is not None:
+            return self.galvo_angles_to_point_at_depth(theta_x, theta_y, float(self.fixed_reverse_depth_z_mm))
+        return self.galvo_angles_to_point_on_plane(theta_x, theta_y)
+
+    def _galvo_point_to_camera(self, point_g: np.ndarray) -> Optional[np.ndarray]:
+        relative = point_g - self.t_gc
+        return self.R_gc.T @ relative
+
+    def _camera_point_to_pixel(self, camera_point: np.ndarray) -> Optional[Tuple[float, float]]:
+        z = camera_point[2]
+        if abs(z) < 1e-9:
+            return None
+        x = camera_point[0] / z
+        y = camera_point[1] / z
+        pixel_x = x * self.K[0, 0] + self.K[0, 2]
+        pixel_y = y * self.K[1, 1] + self.K[1, 2]
+        return (float(pixel_x), float(pixel_y))
+
+    def galvo_code_to_pixel_simple(
+        self,
+        galvo_x: float,
+        galvo_y: float,
+        image_width: int,
+        image_height: int,
+    ) -> Tuple[float, float]:
+        mapping = self.params.get('simple_mapping', {})
+        use_safe = bool(mapping.get('use_safe_range', True))
+        max_range = float(mapping.get('max_safe_range' if use_safe else 'protocol_max', 32767))
+        offset_x = float(mapping.get('offset_x', 0.0))
+        offset_y = float(mapping.get('offset_y', 0.0))
+
+        norm_x = (galvo_x - offset_x) / (max_range * 2.0)
+        norm_y = (galvo_y - offset_y) / (max_range * 2.0)
+        pixel_x = (norm_x + 0.5) * image_width
+        pixel_y = (norm_y + 0.5) * image_height
+        return (float(pixel_x), float(pixel_y))
+
+    # ------------------------------------------------------------------
+    # Geometry utilities reused by calibrators
+    # ------------------------------------------------------------------
+
+    def pixel_depth_to_point_galvo(self, pixel_x: float, pixel_y: float, depth_m: float) -> Optional[np.ndarray]:
+        if depth_m is None or depth_m <= 0:
+            return None
+        x_c = (pixel_x - self.K[0, 2]) / self.K[0, 0] * depth_m * 1000.0
+        y_c = (pixel_y - self.K[1, 2]) / self.K[1, 1] * depth_m * 1000.0
+        z_c = depth_m * 1000.0
+        point_c = np.array([x_c, y_c, z_c], dtype=np.float64)
+        return self.R_gc @ point_c + self.t_gc
+
+    def galvo_angles_to_point_on_plane(self, theta_x: float, theta_y: float) -> Optional[np.ndarray]:
+        direction = self._direction_from_angles(theta_x, theta_y)
+        return self._ray_plane_intersection(np.zeros(3, dtype=np.float64), direction)
+
+    def galvo_angles_to_point_depth_cam(self, theta_x: float, theta_y: float, z_ref_mm: float) -> np.ndarray:
         tx = np.tan(theta_x)
         ty = np.tan(theta_y)
         return np.array([-z_ref_mm * tx, -z_ref_mm * ty, z_ref_mm], dtype=np.float64)
 
-    def galvo_angles_to_point_at_depth(self, theta_x, theta_y, z_ref_mm):
-        """
-        用固定深度面 z = z_ref_mm（振镜系）求交点。
-        """
-        try:
-            x = np.tan(theta_x)
-            y = np.tan(theta_y)
-            z = 1.0
-            dir_g = np.array([x, y, z], dtype=np.float64)
-            dir_g /= np.linalg.norm(dir_g)
-            org_g = np.zeros(3, dtype=np.float64)
-
-            if abs(dir_g[2]) < 1e-9:
-                return None
-            t = (z_ref_mm - org_g[2]) / dir_g[2]
-            if t <= 0:
-                return None
-            return org_g + t * dir_g
-        except Exception:
+    def galvo_angles_to_point_at_depth(self, theta_x: float, theta_y: float, z_ref_mm: float) -> Optional[np.ndarray]:
+        direction = self._direction_from_angles(theta_x, theta_y)
+        if abs(direction[2]) < 1e-9:
             return None
-
-    def choose_reverse_intersection(self, theta_x, theta_y):
-        """
-        反向回投的交点选择：
-        1) 如果有 last_hit_point_g，优先在相同 z 面上取交点（保持与正向深度一致）
-        2) 如果配置了固定深度 fixed_reverse_depth_z_mm，使用它
-        3) 否则回退到工作平面
-        返回：intersection_point_g 或 None
-        """
-        # 1) 目标的深度
-        if isinstance(self.last_hit_point_g, np.ndarray) and self.last_hit_point_g.shape == (3,):
-            z_ref = float(self.last_hit_point_g[2])
-            p = self.galvo_angles_to_point_depth_cam(theta_x, theta_y, z_ref)
-            # print("galvo 2 pixel p",p)
-            if p is not None:
-                return p
-
-        # 2) 固定深度
-        if self.fixed_reverse_depth_z_mm is not None:
-            p = self.galvo_angles_to_point_at_depth(theta_x, theta_y, float(self.fixed_reverse_depth_z_mm))
-            if p is not None:
-                return p
-
-        # 3) 工作平面
-        return self.galvo_angles_to_point_on_plane(theta_x, theta_y)
-
-    def point_to_camera_ray(self, point_g):
-        """
-        振镜系点 → 相机系视线方向
-        """
-        try:
-            xg, yg, zg =  self.t_gc[0], self.t_gc[1], self.t_gc[2]
-            t_cg = [xg, -yg, zg]
-            # print("t_g:",self.t_gc)
-            camera_to_point = point_g #- self.t_gc
-            # print("camera 2 point1",camera_to_point)
-            # camera_to_point = camera_to_point / np.linalg.norm(camera_to_point)
-            p_gc = self.R_gc.T @ camera_to_point  #from galvo corr to cam corr
-            p_gc  = p_gc + t_cg
-            return p_gc
-        except Exception:
+        t = (z_ref_mm - 0.0) / direction[2]
+        if t <= 0:
             return None
+        return direction * t
 
-    def camera_ray_to_pixel(self, p_gc, image_width, image_height):
+    @staticmethod
+    def _direction_from_angles(theta_x: float, theta_y: float) -> np.ndarray:
+        dir_vec = np.array([np.tan(theta_x), np.tan(theta_y), 1.0], dtype=np.float64)
+        norm = np.linalg.norm(dir_vec)
+        return dir_vec / norm if norm > 1e-9 else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Misc utilities
+    # ------------------------------------------------------------------
+
+    def switch_transform_mode(self, use_3d_transform: bool) -> None:
+        self.use_3d_transform = bool(use_3d_transform)
+
+    def update_camera_matrix(self, camera_info_msg) -> None:
         try:
-            if abs(p_gc[2]) < 1e-9:
-                return None
-            x = p_gc[0] / p_gc[2]
-            y = p_gc[1] / p_gc[2]
+            self.K = np.array(camera_info_msg.K, dtype=np.float64).reshape(3, 3)
+            self.D = np.array(camera_info_msg.D, dtype=np.float64)
+            self.use_distortion = bool(len(self.D))
+        except Exception as exc:
+            rospy.logwarn(f'Failed to update camera matrix from CameraInfo: {exc}')
 
-            pixel_x = x * self.K[0, 0] + self.K[0, 2]
-            pixel_y = y * self.K[1, 1] + self.K[1, 2]
-
-            return (pixel_x, pixel_y)
-        except Exception:
-            return None
-
-    def galvo_code_to_pixel_3d(self, galvo_x, galvo_y, image_width, image_height):
-        """
-        code -> 角度 -> 交点-> pixel
-        """
-        try:
-            # print("galvo x,y", galvo_x, galvo_y)
-            if self.use_mech_compensation:
-                alpha, beta = self.codes_to_angles_mech(galvo_x, galvo_y)
-                # 对应关系：alpha -> theta_y, beta -> theta_x
-                theta_y, theta_x = alpha, beta
-            else:
-                theta_x, theta_y = self.codes_to_angles(galvo_x, galvo_y)
-
-            # print("galvo 2 pixel thetax,y",theta_x,theta_y)
-            max_code = self.active_profile_max_code
-            # if abs(galvo_x) >= max_code - 1 or abs(galvo_y) >= max_code - 1:
-            #     rospy.logwarn_throttle(1.0, "galvo_code appears saturated; reverse projection may be inaccurate")
-
-            intersection_point = self.choose_reverse_intersection(theta_x, theta_y)
-            # print("cam_p ",intersection_point)
-            if intersection_point is None:
-                return None
-
-            p_gc = self.point_to_camera_ray(intersection_point)
-            # print("p_gc",p_gc)
-            if p_gc is None:
-                return None
-
-            pixel = self.camera_ray_to_pixel(p_gc, image_width, image_height)
-            # print("pixel ",pixel)
-            return pixel
-
-        except Exception as e:
-            rospy.logdebug(f"3D reverse transform exception: {e}")
-            return None
-
-    def galvo_code_to_pixel_simple(self, galvo_x, galvo_y, image_width, image_height):
-        if self.simple_use_safe_range:
-            max_range = self.simple_max_safe_range
-            scale_factor = max_range * 2
-        else:
-            max_range = self.simple_protocol_max
-            scale_factor = max_range * 2
-
-        galvo_x_centered = galvo_x - self.simple_offset_x
-        galvo_y_centered = galvo_y - self.simple_offset_y
-
-        norm_x = galvo_x_centered / scale_factor
-        norm_y = galvo_y_centered / scale_factor
-
-        pixel_x = (norm_x + 0.5) * image_width
-        pixel_y = (norm_y + 0.5) * image_height
-
-        return (pixel_x, pixel_y)
-
-    # -------------------- 模式切换/工具 --------------------
-
-    def switch_transform_mode(self, use_3d_transform):
-        old_mode = "3D geometric transform" if self.use_3d_transform else "Simple linear mapping"
-        new_mode = "3D geometric transform" if use_3d_transform else "Simple linear mapping"
-
-        self.use_3d_transform = use_3d_transform
-        self.params['transform_mode']['use_3d_transform'] = use_3d_transform
-
-        if use_3d_transform and not getattr(self, 'transform_3d_initialized', False):
-            self.init_3d_transform()
-
-        self.transform_fail_count = 0
-
-        rospy.loginfo(f"Coordinate transform mode switched: {old_mode} -> {new_mode}")
-
-    def update_camera_matrix(self, camera_info_msg):
-        try:
-            K_flat = camera_info_msg.K
-            self.K = np.array(K_flat).reshape(3, 3)
-            self.D = np.array(camera_info_msg.D)
-            self.use_distortion = len(self.D) > 0
-
-            self.params['camera_matrix']['fx'] = self.K[0, 0]
-            self.params['camera_matrix']['fy'] = self.K[1, 1]
-            self.params['camera_matrix']['cx'] = self.K[0, 2]
-            self.params['camera_matrix']['cy'] = self.K[1, 2]
-            self.params['distortion_coeffs'] = self.D.tolist()
-
-            rospy.loginfo("Camera intrinsics updated from CameraInfo message")
-
-        except Exception as e:
-            rospy.logwarn(f"Failed to update camera intrinsics from CameraInfo: {e}")
-
-
-    def get_transform_info(self):
-        info = {
-            'last_pixel_pos': self.last_pixel_pos,
-            'last_galvo_pos': self.last_galvo_pos,
+    def get_transform_info(self) -> Dict[str, object]:
+        return {
+            'active_profile': self.get_profile_metadata(self.active_profile_index),
             'transform_valid': self.transform_valid,
             'transform_method': self.transform_method_used,
             'use_3d_transform': self.use_3d_transform,
-            'transform_fail_count': getattr(self, 'transform_fail_count', 0),
-            'galvo_params': self.active_galvo_params,
-            'simple_mapping': self.params['simple_mapping'],
+            'last_pixel_pos': self.last_pixel_pos,
+            'last_galvo_pos': self.last_galvo_pos,
             'fixed_reverse_depth_z_mm': self.fixed_reverse_depth_z_mm,
-            'active_galvo_profile': self.get_profile_metadata(self.active_profile_index),
-            'galvo_profiles': self.list_galvo_profiles()
         }
 
-        if self.use_3d_transform and hasattr(self, 't_gc'):
-            info.update({
-                'camera_position': self.t_gc.tolist(),
-                'work_plane_distance': self.d_g,
-                'camera_matrix': self.K.tolist() if hasattr(self, 'K') else None,
-                'transform_3d_initialized': getattr(self, 'transform_3d_initialized', False)
-            })
 
-        return info
-
-
-
-if __name__ == "__main__":
-    #for test
-    import sys
-    print("Testing 3D geometric transform with depth-aware reverse...")
-    t = CameraGalvoTransform(use_3d_transform=True)
-    # 可选：固定反向深度
-    t.set_fixed_depth_for_reverse(500.0)
-    test_points = [(640, 407)]
-    for px, py in test_points:
-        res = t.galvo_code_to_pixel(px, py)
-        print("p2g:", (px, py), "->", res)
-        if res:
-            uv = t.galvo_code_to_pixel(res[0], res[1])
-            print("g2p:", res, "->", uv)
+if __name__ == '__main__':  # pragma: no cover - manual smoke test
+    transform = CameraGalvoTransform()
+    print('Loaded', transform.get_galvo_profile_count(), 'galvo profile(s) from', transform.config_file_path)
