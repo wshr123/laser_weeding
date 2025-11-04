@@ -135,7 +135,15 @@ class CameraGalvoTransform:
             'y_minus': float(self.default_params['galvo_params'].get('scan_angle_y_minus', default_half_angle)),
         }
 
+        # 在加载配置之前，先使用默认外参初始化基础姿态，
+        # 以便即便禁用 3D 反投影也能正常构建振镜 profile。
+        default_ext = self.default_params['extrinsics']
+        self.t_gc = np.array(default_ext['t_gc'], dtype=np.float64)
+        self.q_gc = np.array(default_ext['q_gc'], dtype=np.float64)
+        self.R_gc = Rotation.from_quat(self.q_gc).as_matrix()
+
         self.load_config(self.config_file_path)
+        self._refresh_base_extrinsics_from_params()
 
         if self.use_3d_transform:
             self.init_3d_transform()
@@ -210,6 +218,41 @@ class CameraGalvoTransform:
             rospy.loginfo("Using default configuration parameters")
 
         self._update_axis_angle_limits()
+
+    def _refresh_base_extrinsics_from_params(self) -> None:
+        """从当前参数表刷新基础外参姿态，保证非 3D 模式也有有效的 t_gc/R_gc。"""
+
+        extrinsics = self.params.get('extrinsics', {}) or {}
+
+        t_gc_values = extrinsics.get('t_gc_mm', extrinsics.get('t_gc', None))
+        if t_gc_values is None:
+            t_gc_values = self.default_params['extrinsics']['t_gc']
+        self.t_gc = np.array(t_gc_values, dtype=np.float64)
+
+        # 处理姿态，优先使用矩阵，其次是四元数。
+        if 'R_gc' in extrinsics:
+            R_gc = np.array(extrinsics['R_gc'], dtype=np.float64)
+            try:
+                rot = Rotation.from_matrix(R_gc)
+            except ValueError:
+                rot = Rotation.from_quat(self.default_params['extrinsics']['q_gc'])
+        else:
+            quat = extrinsics.get('q_gc_xyzw', extrinsics.get('q_gc', None))
+            if quat is None:
+                quat = self.default_params['extrinsics']['q_gc']
+            quat = np.array(quat, dtype=np.float64)
+            if quat.shape != (4,):
+                quat = np.array(self.default_params['extrinsics']['q_gc'], dtype=np.float64)
+            # scipy 要求规范化四元数
+            norm = np.linalg.norm(quat)
+            if norm == 0:
+                quat = np.array(self.default_params['extrinsics']['q_gc'], dtype=np.float64)
+            else:
+                quat = quat / norm
+            rot = Rotation.from_quat(quat)
+
+        self.R_gc = rot.as_matrix()
+        self.q_gc = rot.as_quat()
 
     def update_params_recursive(self, default_dict, update_dict):
         for key, value in update_dict.items():
