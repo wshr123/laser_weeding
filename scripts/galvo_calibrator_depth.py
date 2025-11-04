@@ -63,6 +63,8 @@ class ManualGalvoCalibrationNode:
             rospy.logerr(f"Failed to initialize coordinate transformer: {e}")
             raise
 
+        self._init_galvo_display_state()
+
         try:
             limits = self.coordinate_transform.get_code_limits(self.galvo_index)
             self.galvo_limits = limits
@@ -308,6 +310,7 @@ class ManualGalvoCalibrationNode:
                     self.galvo_controller.move_to_position(hx, hy, galvo_index=self.galvo_index)
 
                 self.current_galvo_pos = target_pos_logical  # 记录当前“逻辑”位置
+                self._set_display_code(self.galvo_index, hx, hy)
 
                 galvo_msg = Int32MultiArray()
                 galvo_msg.data = [int(target_pos_logical[0]), int(target_pos_logical[1]), 1 if self.laser_on else 0]
@@ -1019,27 +1022,7 @@ class ManualGalvoCalibrationNode:
             cv2.putText(result, label, (int(center[0] + 20), int(center[1])),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # 当前振镜位置
-        try:
-            hx, hy = self._to_hw_axes(self.current_galvo_pos[0], self.current_galvo_pos[1])
-            self.coordinate_transform.set_active_galvo_profile(self.galvo_index)
-            galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
-                int(hx), int(hy), self.image_width, self.image_height
-            )
-            # print("galvo_pixel",galvo_pixel)
-            if galvo_pixel is not None:
-                x, y = int(round(galvo_pixel[0])), int(round(galvo_pixel[1]))
-                if 0 <= x < self.image_width and 0 <= y < self.image_height:
-                    color = (0, 0, 255) if self.laser_on else (255, 255, 0)
-                    cv2.line(result, (x - 20, y), (x + 20, y), color, 3)
-                    cv2.line(result, (x, y - 20), (x, y + 20), color, 3)
-                    cv2.circle(result, (x, y), 10, color, 3)
-                    cv2.putText(result, "LASER ON" if self.laser_on else "GALVO",
-                                (x + 25, y - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                    coord_text = f"LOGIC({self.current_galvo_pos[0]},{self.current_galvo_pos[1]})"
-                    cv2.putText(result, coord_text, (x + 25, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        except Exception:
-            pass
+        result = self._draw_all_galvo_markers(result)
 
         # AUTO 位置
         if self.current_target:
@@ -1057,6 +1040,112 @@ class ManualGalvoCalibrationNode:
                         cv2.circle(result, (ax, ay), 8, (255, 0, 255), 2)
                         cv2.putText(result, "AUTO", (ax + 15, ay + 15),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            except Exception:
+                pass
+
+        return result
+
+    def _init_galvo_display_state(self):
+        try:
+            self.galvo_count = self.coordinate_transform.get_galvo_profile_count()
+        except Exception:
+            self.galvo_count = 1
+
+        self.galvo_names = []
+        self.galvo_display_codes = []
+
+        for idx in range(self.galvo_count):
+            metadata = self._fetch_galvo_metadata(idx)
+            self.galvo_names.append(metadata.get('name', f'galvo_{idx}'))
+
+            offset = metadata.get('code_offset', [0.0, 0.0])
+            if not isinstance(offset, (list, tuple)) or len(offset) != 2:
+                offset = [0.0, 0.0]
+
+            hw_x, hw_y = self._to_hw_axes(offset[0], offset[1])
+            self.galvo_display_codes.append([int(hw_x), int(hw_y)])
+
+        if self.galvo_index >= self.galvo_count:
+            rospy.logwarn(
+                f"Configured galvo_index={self.galvo_index} exceeds available galvos ({self.galvo_count});"
+                " clamping to last profile."
+            )
+            self.galvo_index = max(0, self.galvo_count - 1)
+
+        if 0 <= self.galvo_index < len(self.galvo_names):
+            self.galvo_name = self.galvo_names[self.galvo_index]
+
+    def _fetch_galvo_metadata(self, index):
+        try:
+            return self.coordinate_transform.get_profile_metadata(index)
+        except Exception:
+            return {}
+
+    def _set_display_code(self, index, x_code, y_code):
+        if 0 <= index < len(self.galvo_display_codes):
+            self.galvo_display_codes[index][0] = int(x_code)
+            self.galvo_display_codes[index][1] = int(y_code)
+
+    def _get_display_code(self, index):
+        if 0 <= index < len(self.galvo_display_codes):
+            return self.galvo_display_codes[index]
+        return None
+
+    def _draw_all_galvo_markers(self, image):
+        if not hasattr(self, 'galvo_count') or self.galvo_count <= 0:
+            return image
+
+        result = image
+        try:
+            active_idx = self.coordinate_transform.active_profile_index
+        except AttributeError:
+            active_idx = self.galvo_index
+
+        try:
+            for idx in range(self.galvo_count):
+                codes = self._get_display_code(idx)
+                if not codes:
+                    continue
+
+                try:
+                    self.coordinate_transform.set_active_galvo_profile(idx)
+                except Exception:
+                    continue
+
+                galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
+                    int(codes[0]), int(codes[1]), self.image_width, self.image_height
+                )
+
+                if galvo_pixel is None:
+                    continue
+
+                x, y = int(round(galvo_pixel[0])), int(round(galvo_pixel[1]))
+                if not (0 <= x < self.image_width and 0 <= y < self.image_height):
+                    continue
+
+                is_active = (idx == self.galvo_index)
+                if is_active:
+                    color = (0, 0, 255) if self.laser_on else (0, 165, 255)
+                else:
+                    color = (255, 255, 0)
+
+                cv2.line(result, (x - 16, y), (x + 16, y), color, 2)
+                cv2.line(result, (x, y - 16), (x, y + 16), color, 2)
+                cv2.circle(result, (x, y), 8, color, 2)
+
+                label = self.galvo_names[idx] if idx < len(self.galvo_names) else f'galvo_{idx}'
+                if is_active:
+                    label += " [ACTIVE]"
+                    if self.laser_on:
+                        label += " LASER"
+
+                cv2.putText(result, label, (x + 20, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                cv2.putText(result, f"CODE({codes[0]},{codes[1]})", (x + 20, y + 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        finally:
+            try:
+                self.coordinate_transform.set_active_galvo_profile(active_idx)
             except Exception:
                 pass
 
