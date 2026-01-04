@@ -214,7 +214,8 @@ class ManualGalvoCalibrationNode:
 
     def cleanup(self):
         self.running = False
-        self.set_laser(False)
+        if hasattr(self, 'laser_on'):
+            self.set_laser(False)
         self.restore_terminal()
         if hasattr(self, 'galvo_controller') and self.galvo_controller:
             try:
@@ -322,7 +323,7 @@ class ManualGalvoCalibrationNode:
                 time.sleep(0.01)
 
     def set_laser(self, enable):
-        if self.laser_on != enable:
+        if not hasattr(self, 'laser_on') or self.laser_on != enable:
             self.laser_on = enable
             laser_msg = Bool()
             laser_msg.data = enable
