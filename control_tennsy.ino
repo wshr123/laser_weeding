@@ -33,7 +33,7 @@ XY2Driver galvo_secondary;
 XY2Driver* galvos[GALVO_COUNT] = {&galvo_primary, &galvo_secondary};
 
 // ===== 激光控制引脚 =====
-const int LASER_PIN = 9;        // 激光TTL控制 (开/关)
+const int LASER_PINS[GALVO_COUNT] = {9, 10};  // 两个激光器的TTL控制引脚
 
 // ===== 系统状态 =====
 // 位置控制
@@ -46,7 +46,7 @@ int16_t requested_target_y[GALVO_COUNT] = {0}; // 原始目标Y位置（未校�
 uint8_t active_galvo = 0;                      // 当前选中的振镜
 
 // 激光状态
-bool laser_enabled = false;      // 激光开关状态
+bool laser_enabled[GALVO_COUNT] = {false, false};  // 每个振镜的激光开关状态
 
 // 运动控制
 bool is_moving[GALVO_COUNT] = {false};          // 是否正在移动
@@ -78,7 +78,7 @@ size_t buffer_index = 0;
 // 时间控制
 unsigned long last_update_time[GALVO_COUNT] = {0};
 unsigned long last_status_time = 0;
-unsigned long laser_start_time = 0;
+unsigned long laser_start_time[GALVO_COUNT] = {0, 0};  // 每个振镜的激光启动时间
 
 // 保持中心与保活
 bool hold_center[GALVO_COUNT] = {true, true};                 // 上电后保持在(0,0)直到收到移动指令
@@ -132,8 +132,11 @@ void setup() {
   Serial.println("=====================================");
   
   // 配置激光引脚
-  pinMode(LASER_PIN, OUTPUT);
-  digitalWrite(LASER_PIN, LOW);
+  for (uint8_t i = 0; i < GALVO_COUNT; i++) {
+    pinMode(LASER_PINS[i], OUTPUT);
+    digitalWrite(LASER_PINS[i], LOW);
+    laser_enabled[i] = false;
+  }
   
   // 初始化XY2-100
   Serial.print("Initializing ");
@@ -216,10 +219,12 @@ void loop() {
     }
   }
   
-  // 检查激光超时
-  if (laser_enabled && (millis() - laser_start_time > MAX_LASER_ON_TIME)) {
-    Serial.println("WARNING: Laser timeout - auto shutdown");
-    setLaser(false);
+  // 检查每个振镜的激光超时
+  for (uint8_t i = 0; i < GALVO_COUNT; i++) {
+    if (laser_enabled[i] && (millis() - laser_start_time[i] > MAX_LASER_ON_TIME)) {
+      Serial.println("WARNING: Laser G" + String(i + 1) + " timeout - auto shutdown");
+      setGalvoLaser(i, false);
+    }
   }
   
   // 定期状态报告（可选）
@@ -594,19 +599,27 @@ void updatePosition(uint8_t galvo_index) {
 }
 
 // ===== 激光控制 =====
-void setLaser(bool on) {
-  laser_enabled = on;
-  digitalWrite(LASER_PIN, on ? HIGH : LOW);
+void setGalvoLaser(uint8_t galvo_idx, bool on) {
+  if (galvo_idx >= GALVO_COUNT) return;
+  laser_enabled[galvo_idx] = on;
+  digitalWrite(LASER_PINS[galvo_idx], on ? HIGH : LOW);
   
   if (on) {
-    laser_start_time = millis();
+    laser_start_time[galvo_idx] = millis();
   }
+}
+
+void setLaser(bool on) {
+  // 兼容旧协议：控制当前激活振镜的激光
+  setGalvoLaser(active_galvo, on);
 }
 
 // ===== 紧急停止 =====
 void emergencyStop() {
-  // 立即关闭激光
-  setLaser(false);
+  // 立即关闭所有激光
+  for (uint8_t i = 0; i < GALVO_COUNT; i++) {
+    setGalvoLaser(i, false);
+  }
 
   // 停止所有运动
   for (uint8_t i = 0; i < GALVO_COUNT; i++) {
@@ -634,7 +647,11 @@ void sendStatus() {
   String status = "STATUS:";
   status += "MODE=" + String(laserModeName());
   status += ",ACTIVE=G" + String(active_galvo + 1);
-  status += ",LASER=" + String(laser_enabled ? "ON" : "OFF");
+  status += ",LASER=";
+  for (uint8_t i = 0; i < GALVO_COUNT; i++) {
+    if (i > 0) status += "/";
+    status += "G" + String(i + 1) + ":" + String(laser_enabled[i] ? "ON" : "OFF");
+  }
   status += ",SPIRAL(R=" + String(spiral_max_radius);
   status += ",S=" + String(spiral_spacing, 2);
   status += ",D=" + String(spiral_point_delay_us);
@@ -667,7 +684,7 @@ void testPattern() {
   // 保存当前状态
   int16_t saved_x = requested_target_x[idx];
   int16_t saved_y = requested_target_y[idx];
-  bool saved_laser = laser_enabled;
+  bool saved_laser = laser_enabled[idx];
   bool saved_hold = hold_center[idx];
 
   // 测试前解除保持，避免保活干扰
