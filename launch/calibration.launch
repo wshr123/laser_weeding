@@ -32,15 +32,13 @@
 
         <!-- 坐标变换配置 -->
         <param name="use_3d_transform" value="true" />
-        <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
+        <param name="transform_config_file" value="$(find laser_weeding)/cam_params.yaml" />
 
         <!-- 图像参数 -->
         <param name="image_width" value="1280" />
         <param name="image_height" value="720" />
         <param name="image_topic" value="'/camera/color/image_raw'" />
-        <param name="galvo_index" value="1" />
-        <param name="use_3d_transform" value="true" />
-        <param name="transform_config_file" value="$(find laser_weeding)/yaml/cam_params.yaml" />
+        <param name="galvo_index" value="0" />
         <!-- 校准结果保存 -->
         <param name="calibration_result_file" value="$(find laser_weeding)/yaml/manual_galvo_calibration.yaml" />
 
