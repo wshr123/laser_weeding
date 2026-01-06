@@ -1,0 +1,31 @@
+<launch>
+    <!-- 
+        跟踪效果评估启动文件
+        
+        使用方法：
+        1. 启动主系统（启用跟踪评估）：
+           roslaunch laser_weeding main.launch enable_tracking_evaluation:=true
+        
+        2. 或者使用此launch文件同时启动主系统和评估器：
+           roslaunch laser_weeding tracking_evaluation.launch
+    -->
+    
+    <!-- 包含主系统启动（启用跟踪评估） -->
+    <include file="$(find laser_weeding)/launch/main.launch">
+        <arg name="enable_tracking_evaluation" value="true" />
+    </include>
+    
+    <!-- 跟踪评估器节点 -->
+    <node pkg="laser_weeding" type="tracking_evaluator.py" name="tracking_evaluator" output="screen">
+        <!-- 输出目录（可选，默认：~/tracking_evaluation/时间戳） -->
+        <param name="output_dir" value="" />
+        
+        <!-- 是否保存可视化图像（会增加存储空间） -->
+        <param name="save_images" value="false" />
+        
+        <!-- 自动保存间隔（秒） -->
+        <param name="save_interval" value="10.0" />
+    </node>
+    
+</launch>
+
