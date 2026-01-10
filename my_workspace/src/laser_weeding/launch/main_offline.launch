@@ -106,9 +106,10 @@
         <!-- 激光控制 -->
         <param name="aiming_time" value="0.15" />
         <param name="laser_time" value="0.5" />
+        <param name="laser_mode" value="spiral" />
 
         <!-- 振镜参数 -->
-        <param name="serial_port" value="/dev/ttyACM0" />
+        <param name="serial_port" value="/dev/ttyACM1" />
         <param name="serial_baudrate" value="115200" />
         <param name="min_move_step" value="0" />
 

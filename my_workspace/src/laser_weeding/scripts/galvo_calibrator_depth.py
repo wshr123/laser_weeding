@@ -7,6 +7,7 @@ import numpy as np
 import rospy
 import time
 import yaml
+from yaml.representer import SafeRepresenter
 import os
 import math
 from std_msgs.msg import String, Int32MultiArray, Bool
@@ -21,6 +22,24 @@ from scipy.spatial.transform import Rotation
 # 自有模块
 from coordinate_transform import CameraGalvoTransform, resolve_config_path
 from send_to_teensy import XY2_100Controller
+
+
+class FlowStyleDumper(yaml.SafeDumper):
+    """自定义 YAML Dumper，对数值列表使用 flow style（紧凑格式）"""
+    def represent_list(self, data):
+        """自定义列表表示，对数值列表使用 flow style"""
+        # 对于数值列表（坐标、系数等），使用 flow style（紧凑格式）
+        if len(data) > 0 and isinstance(data[0], (int, float, np.integer, np.floating)):
+            return self.represent_sequence('tag:yaml.org,2002:seq', data, flow_style=True)
+        # 对于嵌套列表（如 R_gc 矩阵），使用 block style
+        if len(data) > 0 and isinstance(data[0], list):
+            return self.represent_sequence('tag:yaml.org,2002:seq', data, flow_style=False)
+        # 其他情况使用 block style
+        return self.represent_sequence('tag:yaml.org,2002:seq', data, flow_style=False)
+
+
+# 注册自定义 representer
+FlowStyleDumper.add_representer(list, FlowStyleDumper.represent_list)
 
 
 class CircleTrack:
@@ -142,24 +161,33 @@ class ManualGalvoCalibrationNode:
             rospy.logwarn(f"Failed to push galvo limits to controller: {exc}")
 
         # ========== 状态 ==========
-        self.calibration_state = "IDLE"  # IDLE, CENTERING, SELECTING, MANUAL_AIMING
+        self.calibration_state = "IDLE"  # IDLE, CENTERING, SELECTING, MANUAL_AIMING, TESTING
         self.calibration_data = []
         self.current_target_index = -1
         self.current_target = None
 
         self.detected_circles = []
         self.selected_targets = []
+        
+        # 测试模式相关
+        self.test_targets = []  # 测试目标列表
+        self.test_mode = False  # 是否处于测试模式
+        self.tested_target_indices = set()  # 已瞄准过的测试目标索引集合
 
         self.current_image = None
         self.first_frame_synced = False  # 首帧同步宽高
 
         # 黑色圆检测参数
-        self.min_circle_radius = 10
-        self.max_circle_radius = 150
+        self.min_circle_radius = rospy.get_param('~min_circle_radius', 10)
+        self.max_circle_radius = rospy.get_param('~max_circle_radius', 150)
         
-        # 黑色圆圈检测方法选择: 'hsv' 或 'adaptive_threshold'
-        # 手动修改此处来选择检测方法
-        self.detection_method = 'adaptive_threshold'  # 可选: 'hsv' 或 'adaptive_threshold'
+        # 黑色圆圈检测方法选择: 'hsv', 'adaptive_threshold' 或 'blob_detector'
+        self.detection_method = rospy.get_param('~detection_method', 'blob_detector')
+        
+        # SimpleBlobDetector参数（仅在blob_detector方法中使用）
+        self.blob_min_circularity = rospy.get_param('~blob_min_circularity', 0.7)
+        self.blob_min_convexity = rospy.get_param('~blob_min_convexity', 0.8)
+        self.blob_min_inertia_ratio = rospy.get_param('~blob_min_inertia_ratio', 0.7)
 
         # 圆圈跟踪池（使用CircleTrack类）
         self.tracks = []  # List[CircleTrack]
@@ -218,6 +246,7 @@ class ManualGalvoCalibrationNode:
             # 其他功能键
             'h': self.move_to_home,
             'o': self.test_four_corners,
+            't': self.start_test,  # 开始多项式标定测试
         }
 
         # 信号
@@ -285,7 +314,13 @@ class ManualGalvoCalibrationNode:
         self.image_width  = rospy.get_param('~image_width', 640)
         self.image_height = rospy.get_param('~image_height', 480)
 
-        self.calibration_result_file = rospy.get_param('~calibration_result_file', 'manual_galvo_calibration.yaml')
+        calibration_result_param = rospy.get_param('~calibration_result_file', 'yaml/manual_galvo_calibration.yaml')
+        self.calibration_result_file = resolve_config_path(calibration_result_param)
+        rospy.loginfo(f"标定结果保存路径: {self.calibration_result_file}")
+        
+        # 标定方法选择：'svd' 或 'polynomial'
+        self.calibration_method = rospy.get_param('~calibration_method', 'svd')
+        rospy.loginfo(f"标定方法: {self.calibration_method}")
 
     def setup_ros_interface(self):
         # image_topic = rospy.get_param('~image_topic', '/camera/color/image_raw')
@@ -426,6 +461,8 @@ class ManualGalvoCalibrationNode:
             self.move_to_home()
         elif command == 'o':
             self.test_four_corners()
+        elif command == 't':
+            self.start_test()
         # 兼容旧版本的字符串命令
         elif command == 'start':
             self.start_calibration()
@@ -508,6 +545,80 @@ class ManualGalvoCalibrationNode:
                 return None
             return z
 
+    def _calculate_polynomial_code(self, pixel_x, pixel_y):
+        """
+        使用多项式校正计算振镜码值
+        
+        流程：
+        1. 从像素坐标+深度计算物理坐标 (X, Y) 单位：毫米
+        2. 使用多项式校正计算码值：Code = C0 + C1*X + C2*Y + C3*X^2 + C4*X*Y + C5*Y^2
+        
+        Args:
+            pixel_x, pixel_y: 像素坐标
+            
+        Returns:
+            (code_x, code_y) 或 None（如果失败）
+        """
+        try:
+            # 1. 查询深度
+            depth_m = self.depth_query_func(pixel_x, pixel_y)
+            if depth_m is None or depth_m <= 0:
+                rospy.logwarn(f"无法在像素({pixel_x}, {pixel_y})获取有效深度")
+                return None
+            
+            # 2. 使用 pixel_depth_to_point_galvo 计算物理坐标（使用rough外参）
+            # 这会自动根据 active_correction_method 选择合适的外参
+            p_galvo = self.coordinate_transform.pixel_depth_to_point_galvo(
+                pixel_x, pixel_y, depth_m
+            )
+            
+            if p_galvo is None:
+                rospy.logwarn(f"无法计算像素({pixel_x}, {pixel_y})的物理坐标")
+                return None
+            
+            # 提取X和Y坐标（毫米）
+            X_mm = float(p_galvo[0])
+            Y_mm = float(p_galvo[1])
+            
+            # 3. 获取多项式校正系数
+            poly_corr = self.coordinate_transform._active_poly_correction
+            if poly_corr is None:
+                rospy.logwarn("多项式校正参数未加载")
+                return None
+            
+            coeffs_x = poly_corr.get('coefficients_x', None)
+            coeffs_y = poly_corr.get('coefficients_y', None)
+            
+            if coeffs_x is None or coeffs_y is None:
+                rospy.logwarn("多项式校正系数未找到")
+                return None
+            
+            # 确保系数是numpy数组
+            coeffs_x = np.array(coeffs_x, dtype=np.float64)
+            coeffs_y = np.array(coeffs_y, dtype=np.float64)
+            
+            # 4. 构建特征向量：[1, X, Y, X^2, X*Y, Y^2]
+            features = np.array([
+                1.0,
+                X_mm,
+                Y_mm,
+                X_mm ** 2,
+                X_mm * Y_mm,
+                Y_mm ** 2
+            ], dtype=np.float64)
+            
+            # 5. 计算码值：Code = features @ coeffs
+            code_x = float(np.dot(features, coeffs_x))
+            code_y = float(np.dot(features, coeffs_y))
+            
+            return (code_x, code_y)
+            
+        except Exception as e:
+            rospy.logerr(f"计算多项式码值时发生错误: {e}")
+            import traceback
+            rospy.logerr(traceback.format_exc())
+            return None
+
     # ===================== 目标检测 =====================
     def detect_black_circles(self, image):
         """
@@ -517,6 +628,8 @@ class ManualGalvoCalibrationNode:
             final_detections = self._detect_with_hsv(image)
         elif self.detection_method == 'adaptive_threshold':
             final_detections = self._detect_with_adaptive_threshold(image)
+        elif self.detection_method == 'blob_detector':
+            final_detections = self._detect_with_blob_detector(image)
         else:
             rospy.logerr(f"Unknown detection method: {self.detection_method}")
             final_detections = []
@@ -554,7 +667,7 @@ class ManualGalvoCalibrationNode:
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         # V(亮度) < 80, S(饱和度) < 100
         lower_black = np.array([0, 0, 0])
-        upper_black = np.array([180, 100, 80])
+        upper_black = np.array([180, 80, 90])
         mask = cv2.inRange(hsv, lower_black, upper_black)
 
         # -------------------------------------------------
@@ -584,7 +697,7 @@ class ManualGalvoCalibrationNode:
             if perimeter == 0:
                 continue
             circularity = 4 * np.pi * area / (perimeter * perimeter)
-            if circularity < 0.6:
+            if circularity < 0.8:
                 continue
 
             hull = cv2.convexHull(cnt)
@@ -592,7 +705,7 @@ class ManualGalvoCalibrationNode:
             if hull_area == 0:
                 continue
             solidity = area / hull_area
-            if solidity < 0.65:
+            if solidity < 0.8:
                 continue
 
             if len(cnt) < 5:
@@ -603,7 +716,7 @@ class ManualGalvoCalibrationNode:
             MA, ma = axes
             if ma > 0:
                 aspect_ratio = MA / ma
-                if aspect_ratio < 0.65:
+                if aspect_ratio < 0.75:
                     continue
             else:
                 continue
@@ -747,6 +860,160 @@ class ManualGalvoCalibrationNode:
 
         return final_detections
 
+    def _detect_with_blob_detector(self, image):
+        """
+        使用OpenCV的SimpleBlobDetector检测黑色圆圈
+        该方法集成了颜色、面积、圆度、凸度、惯性比等筛选，通常比手写方法更稳定
+        
+        返回格式与现有方法一致: [{'center': (x, y), 'radius': r, 'area': a, 'circularity': c, 'solidity': s, 'score': score}, ...]
+        """
+        # 转换为灰度图
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # 配置SimpleBlobDetector参数
+        params = cv2.SimpleBlobDetector_Params()
+        
+        # 颜色筛选：检测黑色（暗色）blob
+        params.filterByColor = True
+        params.blobColor = 0  # 0表示黑色，255表示白色
+        
+        # 面积筛选：根据min_circle_radius和max_circle_radius计算面积范围
+        params.filterByArea = True
+        min_area = np.pi * (self.min_circle_radius ** 2)
+        max_area = np.pi * (self.max_circle_radius ** 2)
+        params.minArea = int(min_area)
+        params.maxArea = int(max_area)
+        
+        # 圆度筛选：圆形度（4*pi*area/perimeter^2），接近1表示更圆
+        params.filterByCircularity = True
+        params.minCircularity = self.blob_min_circularity
+        params.maxCircularity = 1.0
+        
+        # 凸度筛选：solidity = area / convex_hull_area，接近1表示更凸
+        params.filterByConvexity = True
+        params.minConvexity = self.blob_min_convexity
+        params.maxConvexity = 1.0
+        
+        # 惯性比筛选：长轴/短轴，接近1表示更圆
+        params.filterByInertia = True
+        params.minInertiaRatio = self.blob_min_inertia_ratio
+        params.maxInertiaRatio = 1.0
+        
+        # 创建检测器
+        detector = cv2.SimpleBlobDetector_create(params)
+        
+        # 执行检测
+        keypoints = detector.detect(gray)
+        
+        # 转换为与现有方法一致的格式
+        candidates = []
+        for kp in keypoints:
+            x = int(kp.pt[0])
+            y = int(kp.pt[1])
+            radius = kp.size / 2.0  # size是直径，需要除以2得到半径
+            
+            # 验证半径范围
+            if not (self.min_circle_radius <= radius <= self.max_circle_radius):
+                continue
+            
+            # 计算面积（使用检测到的半径）
+            area = np.pi * (radius ** 2)
+            
+            # 注意：SimpleBlobDetector已经通过filterByCircularity和filterByConvexity筛选过了
+            # 为了获取精确的circularity和solidity值，我们在检测位置周围提取轮廓进行分析
+            # 如果轮廓提取失败，使用基于筛选参数的合理默认值
+            
+            # 在检测位置周围创建ROI（感兴趣区域）
+            roi_size = int(radius * 2.5)  # ROI大小约为直径的2.5倍
+            x_min = max(0, x - roi_size)
+            x_max = min(gray.shape[1], x + roi_size)
+            y_min = max(0, y - roi_size)
+            y_max = min(gray.shape[0], y + roi_size)
+            
+            roi = gray[y_min:y_max, x_min:x_max]
+            if roi.size == 0:
+                # ROI无效，使用默认值
+                circularity = 0.85
+                solidity = 0.9
+            else:
+                # 在ROI中查找轮廓
+                # 使用自适应阈值来提取黑色区域
+                _, thresh = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                # 找到最接近检测中心的轮廓
+                best_contour = None
+                min_dist = float('inf')
+                center_offset_x = x - x_min
+                center_offset_y = y - y_min
+                
+                for cnt in contours:
+                    if len(cnt) < 5:
+                        continue
+                    M = cv2.moments(cnt)
+                    if M['m00'] == 0:
+                        continue
+                    cnt_x = int(M['m10'] / M['m00'])
+                    cnt_y = int(M['m01'] / M['m00'])
+                    dist = np.sqrt((cnt_x - center_offset_x)**2 + (cnt_y - center_offset_y)**2)
+                    if dist < min_dist and dist < radius * 1.5:  # 轮廓应该在检测位置附近
+                        min_dist = dist
+                        best_contour = cnt
+                
+                # 计算circularity和solidity
+                if best_contour is not None and len(best_contour) >= 5:
+                    cnt_area = cv2.contourArea(best_contour)
+                    cnt_perimeter = cv2.arcLength(best_contour, True)
+                    if cnt_perimeter > 0:
+                        circularity = 4 * np.pi * cnt_area / (cnt_perimeter ** 2)
+                    else:
+                        circularity = 0.85
+                    
+                    hull = cv2.convexHull(best_contour)
+                    hull_area = cv2.contourArea(hull)
+                    if hull_area > 0:
+                        solidity = cnt_area / hull_area
+                    else:
+                        solidity = 0.9
+                else:
+                    # 无法提取有效轮廓，使用基于筛选参数的默认值
+                    # SimpleBlobDetector已经筛选过，所以这些值应该是合理的
+                    circularity = 0.85  # 介于minCircularity(0.7)和1.0之间
+                    solidity = 0.9      # 介于minConvexity(0.8)和1.0之间
+            
+            # 计算综合得分（与现有方法一致）
+            score = 0.5 * area + 0.3 * circularity * 1000 + 0.2 * solidity * 1000
+            
+            candidates.append({
+                'center': (x, y),
+                'radius': radius,
+                'area': area,
+                'circularity': circularity,
+                'solidity': solidity,
+                'score': score
+            })
+        
+        # NMS（非极大值抑制）：去除重叠的检测结果
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        final_detections = []
+        nms_threshold = 35  # 与现有方法保持一致
+        
+        while len(candidates) > 0:
+            current = candidates.pop(0)
+            final_detections.append(current)
+            
+            remaining = []
+            for other in candidates:
+                dist = math.sqrt(
+                    (current['center'][0] - other['center'][0]) ** 2 +
+                    (current['center'][1] - other['center'][1]) ** 2
+                )
+                if dist >= nms_threshold:
+                    remaining.append(other)
+            candidates = remaining
+        
+        return final_detections
+
     def update_tracks(self, detections):
         """
         步骤5: 时间一致性跟踪
@@ -814,7 +1081,8 @@ class ManualGalvoCalibrationNode:
         self.current_batch_index += 1
         self.calibration_state = "SELECTING"
         self.selected_targets = self.detected_circles.copy()
-        self.current_target_index = 0
+        self.current_target_index = -1  # 初始化为-1，这样next_target会将其设置为0并瞄准第一个点
+        self.current_target = None  # 重置当前目标
         self.calibration_data = []  # 当前批次的数据
 
         total_points = sum(len(batch['points']) for batch in self.calibration_batches)
@@ -826,41 +1094,150 @@ class ManualGalvoCalibrationNode:
 
         self.next_target()
 
+    def start_test(self):
+        """开始多项式标定效果测试"""
+        # 检查是否配置了多项式校正
+        if (not hasattr(self.coordinate_transform, '_active_poly_correction') or 
+            self.coordinate_transform._active_poly_correction is None):
+            rospy.logwarn("未检测到多项式校正参数，请先进行多项式标定")
+            return
+        
+        # 检查是否有检测到的目标
+        if len(self.detected_circles) < 1:
+            rospy.logwarn("未检测到黑色圆圈，无法开始测试")
+            return
+        
+        # 初始化测试模式
+        self.test_mode = True
+        self.calibration_state = "TESTING"
+        self.test_targets = self.detected_circles.copy()
+        self.current_target_index = -1  # 初始化为-1，这样next_target会将其设置为0并瞄准第一个点
+        self.current_target = None  # 重置当前目标
+        self.tested_target_indices = set()  # 重置已测试目标集合
+        
+        poly_corr = self.coordinate_transform._active_poly_correction
+        coeffs_x = poly_corr.get('coefficients_x', None)
+        coeffs_y = poly_corr.get('coefficients_y', None)
+        
+        rospy.loginfo(f"========================================")
+        rospy.loginfo(f"开始多项式标定效果测试")
+        rospy.loginfo(f"检测到 {len(self.test_targets)} 个测试目标")
+        if coeffs_x and coeffs_y:
+            rospy.loginfo(f"多项式系数 X: {coeffs_x[:3]}... (共{len(coeffs_x)}项)")
+            rospy.loginfo(f"多项式系数 Y: {coeffs_y[:3]}... (共{len(coeffs_y)}项)")
+        rospy.loginfo(f"========================================")
+        rospy.loginfo(f"使用 'N' 键移动到下一个测试点")
+        rospy.loginfo(f"使用 'P' 键移动到上一个测试点")
+        
+        # 自动瞄准第一个测试点
+        self.next_target()
+
     def next_target(self):
-        if self.calibration_state not in ["SELECTING", "MANUAL_AIMING"]:
-            rospy.logwarn("Not in calibration mode")
-            return
-        if self.current_target_index >= len(self.selected_targets):
-            rospy.loginfo("All targets completed. You can save calibration results with 'C' key.")
-            return
+        # 支持测试模式和标定模式
+        if self.calibration_state == "TESTING":
+            # 测试模式
+            # 如果索引小于0，设置为0（第一次调用）
+            if self.current_target_index < 0:
+                self.current_target_index = 0
+            else:
+                # 否则前进到下一个测试点
+                self.current_target_index += 1
+            
+            # 检查是否已经超出范围
+            if self.current_target_index >= len(self.test_targets):
+                rospy.loginfo("所有测试点已完成遍历。按 'T' 重新开始测试。")
+                self.test_mode = False
+                self.calibration_state = "IDLE"
+                return
+            
+            # 获取当前测试目标
+            self.current_target = self.test_targets[self.current_target_index]
+            
+            # 使用多项式校正计算码值
+            pixel_x, pixel_y = self.current_target['center']
+            test_code = self._calculate_polynomial_code(pixel_x, pixel_y)
+            
+            if test_code:
+                code_x, code_y = test_code
+                auto_galvo_pos = self.clamp_galvo_position(code_x, code_y)
+            else:
+                rospy.logwarn("无法计算多项式码值，使用默认方法")
+                code_hw = self.coordinate_transform.pixel_to_galvo_code(
+                    pixel_x, pixel_y, self.image_width, self.image_height, galvo_index=self.galvo_index
+                )
+                if code_hw:
+                    auto_galvo_pos = self.clamp_galvo_position(code_hw[0], code_hw[1])
+                else:
+                    auto_galvo_pos = [0, 0]
+            
+            with self.position_lock:
+                self.target_galvo_pos = auto_galvo_pos.copy()
+                self.manual_galvo_pos = auto_galvo_pos.copy()
+            
+            # 标记当前目标为已瞄准
+            self.tested_target_indices.add(self.current_target_index)
+            
+            rospy.loginfo(f"测试点 {self.current_target_index + 1}/{len(self.test_targets)}: "
+                         f"像素({pixel_x}, {pixel_y}) -> 码值({auto_galvo_pos[0]}, {auto_galvo_pos[1]})")
+            
+        elif self.calibration_state in ["SELECTING", "MANUAL_AIMING"]:
+            # 标定模式：允许按n键前进到下一个目标
+            # 如果索引小于0，设置为0（第一次调用）
+            if self.current_target_index < 0:
+                self.current_target_index = 0
+            else:
+                # 否则前进到下一个目标
+                self.current_target_index += 1
+            
+            # 检查是否已经超出范围
+            if self.current_target_index >= len(self.selected_targets):
+                rospy.loginfo("All targets completed. You can save calibration results with 'C' key.")
+                self.calibration_state = "IDLE"
+                return
 
-        self.current_target = self.selected_targets[self.current_target_index]
-        self.calibration_state = "MANUAL_AIMING"
+            self.current_target = self.selected_targets[self.current_target_index]
+            self.calibration_state = "MANUAL_AIMING"
 
-        pixel_x, pixel_y = self.current_target['center']
-        code_hw = self.coordinate_transform.pixel_to_galvo_code(
-            pixel_x, pixel_y, self.image_width, self.image_height, galvo_index=self.galvo_index
-        )
+            pixel_x, pixel_y = self.current_target['center']
+            code_hw = self.coordinate_transform.pixel_to_galvo_code(
+                pixel_x, pixel_y, self.image_width, self.image_height, galvo_index=self.galvo_index
+            )
 
-        if code_hw:
-            # lx, ly = self._from_hw_axes(int(code_hw[0]), int(code_hw[1]))
-            lx,ly = code_hw[0],code_hw[1]
-            auto_galvo_pos = self.clamp_galvo_position(lx, ly)
+            if code_hw:
+                # lx, ly = self._from_hw_axes(int(code_hw[0]), int(code_hw[1]))
+                lx,ly = code_hw[0],code_hw[1]
+                auto_galvo_pos = self.clamp_galvo_position(lx, ly)
+            else:
+                auto_galvo_pos = [0, 0]
+
+            with self.position_lock:
+                self.target_galvo_pos = auto_galvo_pos.copy()
+                self.manual_galvo_pos = auto_galvo_pos.copy()
+
+            rospy.loginfo(f"目标 {self.current_target_index + 1}/{len(self.selected_targets)}: "
+                         f"像素({pixel_x}, {pixel_y}) -> 码值({auto_galvo_pos[0]}, {auto_galvo_pos[1]})")
+            rospy.loginfo("使用键盘手动调整激光位置，然后按 'R' 记录")
         else:
-            auto_galvo_pos = [0, 0]
-
-        with self.position_lock:
-            self.target_galvo_pos = auto_galvo_pos.copy()
-            self.manual_galvo_pos = auto_galvo_pos.copy()
-
-        rospy.loginfo("Use keyboard to manually adjust laser position, then press 'R' to record")
+            rospy.logwarn(f"Not in calibration or test mode (current state: {self.calibration_state})")
+            return
 
     def previous_target(self):
-        if self.current_target_index > 0:
-            self.current_target_index -= 1
-            self.next_target()
+        if self.calibration_state == "TESTING":
+            # 测试模式
+            if self.current_target_index > 0:
+                self.current_target_index -= 1
+                self.next_target()
+            else:
+                rospy.loginfo("已经是第一个测试点")
+        elif self.calibration_state in ["SELECTING", "MANUAL_AIMING"]:
+            # 标定模式
+            if self.current_target_index > 0:
+                self.current_target_index -= 1
+                self.next_target()
+            else:
+                rospy.loginfo("Already at first target")
         else:
-            rospy.loginfo("Already at first target")
+            rospy.logwarn(f"不在标定或测试模式 (current state: {self.calibration_state})")
 
     def complete_current_batch(self):
         """完成当前批次，准备开始新批次"""
@@ -946,6 +1323,9 @@ class ManualGalvoCalibrationNode:
         rospy.loginfo("  R: 记录当前点 | N/P: 下/上一个目标")
         rospy.loginfo("  C: 保存最终结果 | X: 重置所有数据")
         rospy.loginfo("  SPACE: 自动对准当前目标")
+        rospy.loginfo("")
+        rospy.loginfo("【测试功能】")
+        rospy.loginfo("  T: 开始多项式标定效果测试 | N/P: 在测试模式下切换测试点")
         rospy.loginfo("")
         rospy.loginfo("【其他功能】")
         rospy.loginfo("  L: 激光开关 | I: 初始化到中心")
@@ -1088,160 +1468,222 @@ class ManualGalvoCalibrationNode:
         for batch in self.calibration_batches:
             accumulated_data.extend(batch['points'])
 
-        if len(accumulated_data) < 3:
-            rospy.logwarn(f"三维标定至少需要3个标定点，当前只有 {len(accumulated_data)} 个。\n")
+        min_points = 6 if self.calibration_method == 'polynomial' else 3
+        if len(accumulated_data) < min_points:
+            method_name = "多项式拟合" if self.calibration_method == 'polynomial' else "三维标定"
+            rospy.logwarn(f"{method_name}至少需要{min_points}个标定点，当前只有 {len(accumulated_data)} 个。\n")
+            if self.calibration_method == 'polynomial':
+                rospy.logwarn(f"建议采集9点或16点矩阵（覆盖中心、边缘、四角）以获得更好的拟合效果。\n")
             rospy.logwarn(f"已完成批次: {len(self.calibration_batches)}，请继续标定。\n")
             return
 
         rospy.loginfo("========================================")
-        rospy.loginfo("开始计算三维刚体变换...")
+        if self.calibration_method == 'polynomial':
+            rospy.loginfo("开始计算多项式校正...")
+        else:
+            rospy.loginfo("开始计算三维刚体变换（SVD）...")
         rospy.loginfo(f"总批次数: {len(self.calibration_batches)}")
         rospy.loginfo(f"总标定点数: {len(accumulated_data)}")
         rospy.loginfo("========================================\n")
 
-        points_camera = []
-        points_galvo = []
-        # 遍历所有批次的所有数据点
-        # 1.从像素坐标到振镜坐标(程序识别的)
-        # 2.手动控制的galvo code到振镜坐标
-        # 3.找出两个振镜坐标之间的变换关系
-        for point in accumulated_data:
-            u, v = point['pixel_position']
-            z = point['depth_meters']
-            gx, gy = point['manual_galvo_position_logical']
+        # 根据标定方法选择不同的处理逻辑
+        if self.calibration_method == 'polynomial':
+            # ========== 多项式拟合方法 ==========
+            X_rough_list = []
+            Y_rough_list = []
+            Code_x_list = []
+            Code_y_list = []
+            
+            for point in accumulated_data:
+                u, v = point['pixel_position']
+                z_camera_m = point['depth_meters']  # 相机坐标系下的深度（米）
+                gx, gy = point['manual_galvo_position_logical']
+                
+                # 使用现有外参计算理论物理坐标（解决视差，但包含畸变）
+                p_rough = self.coordinate_transform.pixel_depth_to_point_galvo(u, v, z_camera_m)
+                if p_rough is None:
+                    rospy.logwarn(f"跳过标定点 {point['target_index']}，无法计算理论物理坐标。\n")
+                    continue
+                
+                # 提取X和Y坐标（毫米），Z坐标用于深度参考
+                X_rough = float(p_rough[0])
+                Y_rough = float(p_rough[1])
+                
+                X_rough_list.append(X_rough)
+                Y_rough_list.append(Y_rough)
+                Code_x_list.append(gx)
+                Code_y_list.append(gy)
+                
+                rospy.logdebug(f"标定点 {point['target_index']}: X={X_rough:.2f}mm, Y={Y_rough:.2f}mm, Code=({gx}, {gy})")
+            
+            if len(X_rough_list) < 6:
+                rospy.logerr(f"多项式拟合至少需要6个标定点，当前只有 {len(X_rough_list)} 个。\n")
+                return
+            
+            # 转换为numpy数组
+            X_rough_np = np.array(X_rough_list)
+            Y_rough_np = np.array(Y_rough_list)
+            Code_x_np = np.array(Code_x_list, dtype=np.float64)
+            Code_y_np = np.array(Code_y_list, dtype=np.float64)
+            
+            # 执行多项式拟合
+            try:
+                coeffs_x, coeffs_y, poly_metrics = self.fit_polynomial_correction(
+                    X_rough_np, Y_rough_np, Code_x_np, Code_y_np
+                )
+                rospy.loginfo("多项式拟合计算成功。\n")
+                rospy.loginfo(f"X方向系数: {coeffs_x.tolist()}\n")
+                rospy.loginfo(f"Y方向系数: {coeffs_y.tolist()}\n")
+            except Exception as e:
+                rospy.logerr(f"多项式拟合计算失败: {e}\n")
+                return
+            
+            # 保存多项式校正结果
+            self._save_polynomial_calibration(
+                coeffs_x, coeffs_y, poly_metrics,
+                len(X_rough_list), X_rough_np, Y_rough_np, Code_x_np, Code_y_np
+            )
+            return  # 多项式拟合完成，直接返回
+            
+        else:
+            # ========== SVD方法（原有逻辑） ==========
+            points_camera = []
+            points_galvo = []
+            # 遍历所有批次的所有数据点
+            # 1.从像素坐标+深度计算相机坐标系下的点（不应用外参）
+            # 2.从手动调整的振镜码值计算振镜坐标系下的点
+            # 3.通过SVD找到从相机坐标系到振镜坐标系的变换（新外参）
+            for point in accumulated_data:
+                u, v = point['pixel_position']
+                z_camera_m = point['depth_meters']  # 相机坐标系下的深度（米）
+                gx, gy = point['manual_galvo_position_logical']
 
-            p_cam = self.coordinate_transform.pixel_depth_to_point_galvo(u, v, z)    #from pixel to galvo
-            z = float(p_cam[2]/1000)
-            print("p_cam", p_cam)
-            p_galvo = self._manual_code_to_galvo_frame_mm(gx, gy, z)
-            print("p_galvo", p_galvo)
-            if p_cam is not None and p_galvo is not None:
-                points_camera.append(p_cam)
+                # 1. 将像素+深度转换为相机坐标系下的点（毫米）
+                # 注意：不使用外参变换，因为我们正在计算新的外参
+                p_camera_frame = self._unproject_to_camera_frame_mm(u, v, z_camera_m)
+                if p_camera_frame is None:
+                    rospy.logwarn(f"跳过标定点 {point['target_index']}，像素到相机坐标转换失败。\n")
+                    continue
+                
+                # 2. 将手动调整的振镜码值转换为振镜坐标系下的点
+                # 关键：需要知道振镜激光瞄准的点在振镜坐标系下的深度
+                # 先通过当前外参计算相机观测点在振镜坐标系下的位置（用于获取深度参考）
+                p_cam_in_galvo = self.coordinate_transform.pixel_depth_to_point_galvo(u, v, z_camera_m)
+                if p_cam_in_galvo is None:
+                    rospy.logwarn(f"跳过标定点 {point['target_index']}，无法获取振镜坐标系深度参考。\n")
+                    continue
+                
+                # 使用振镜坐标系下的Z坐标作为深度参考（毫米）
+                z_galvo_mm = float(p_cam_in_galvo[2])
+                
+                # 计算手动调整的振镜码值对应的点（振镜坐标系，毫米）
+                p_galvo = self._manual_code_to_galvo_frame_mm(gx, gy, z_galvo_mm / 1000.0)
+                if p_galvo is None:
+                    rospy.logwarn(f"跳过标定点 {point['target_index']}，振镜码值到坐标转换失败。\n")
+                    continue
+                
+                rospy.logdebug(f"标定点 {point['target_index']}: 相机深度={z_camera_m:.4f}m, 振镜Z={z_galvo_mm:.2f}mm")
+                rospy.logdebug(f"  p_camera_frame={p_camera_frame}, p_galvo={p_galvo}")
+                
+                points_camera.append(p_camera_frame)
                 points_galvo.append(p_galvo)
-            else:
-                rospy.logwarn(f"跳过标定点 {point['target_index']}，因为坐标转换失败。\n")
 
-        if len(points_camera) < 3:
-            rospy.logerr(f"有效标定点不足3个({len(points_camera)}个)，无法进行三维标定。\n")
-            return
+            if len(points_camera) < 3:
+                rospy.logerr(f"有效标定点不足3个({len(points_camera)}个)，无法进行三维标定。\n")
+                return
 
-        points_camera_np = np.array(points_camera, dtype=np.float64)
-        points_galvo_np = np.array(points_galvo, dtype=np.float64)
+            points_camera_np = np.array(points_camera, dtype=np.float64)
+            points_galvo_np = np.array(points_galvo, dtype=np.float64)
 
-        # (调试可选) 保存点云到文件进行可视化检查
-        # np.savetxt("points_camera.txt", points_camera_np, fmt='%.4f')
-        # np.savetxt("points_galvo.txt", points_galvo_np, fmt='%.4f')
+            # (调试可选) 保存点云到文件进行可视化检查
+            # np.savetxt("points_camera.txt", points_camera_np, fmt='%.4f')
+            # np.savetxt("points_galvo.txt", points_galvo_np, fmt='%.4f')
 
-        try:
-            R, t = self.find_rigid_transform_3d(points_camera_np, points_galvo_np)
-            rospy.loginfo("三维变换计算成功。\n")
-            rospy.loginfo(f"新的旋转矩阵 R (相机->振镜):\n{np.round(R, 4)}\n")
-            rospy.loginfo(f"新的平移向量 t (相机->振镜) [mm]:\n{np.round(t, 4)}\n")
-        except Exception as e:
-            rospy.logerr(f"计算三维变换时发生错误: {e}\n")
-            return
+            try:
+                R, t = self.find_rigid_transform_3d(points_camera_np, points_galvo_np)
+                rospy.loginfo("三维变换计算成功。\n")
+                rospy.loginfo(f"新的旋转矩阵 R (相机坐标系 -> 振镜坐标系):\n{np.round(R, 4)}\n")
+                rospy.loginfo(f"新的平移向量 t (相机坐标系 -> 振镜坐标系) [mm]:\n{np.round(t, 4)}\n")
+            except Exception as e:
+                rospy.logerr(f"计算三维变换时发生错误: {e}\n")
+                return
 
-        transformed_points = (R @ points_camera_np.T + t).T
-        residuals = points_galvo_np - transformed_points
-        per_point_error = np.linalg.norm(residuals, axis=1)
-        axis_rmse = np.sqrt(np.mean(residuals ** 2, axis=0))
-        rmse_total = float(np.sqrt(np.mean(np.sum(residuals ** 2, axis=1))))
-        max_error = float(np.max(per_point_error))
-        mean_error = float(np.mean(per_point_error))
+            transformed_points = (R @ points_camera_np.T + t).T
+            residuals = points_galvo_np - transformed_points
+            per_point_error = np.linalg.norm(residuals, axis=1)
+            axis_rmse = np.sqrt(np.mean(residuals ** 2, axis=0))
+            rmse_total = float(np.sqrt(np.mean(np.sum(residuals ** 2, axis=1))))
+            max_error = float(np.max(per_point_error))
+            mean_error = float(np.mean(per_point_error))
 
-        rospy.loginfo(
-            "标定残差统计 (mm): "
-            f"RMSE_total={rmse_total:.3f}, max={max_error:.3f}, mean={mean_error:.3f}, "
-            f"axis_rmse=[{axis_rmse[0]:.3f}, {axis_rmse[1]:.3f}, {axis_rmse[2]:.3f}]\n"
-        )
+            rospy.loginfo(
+                "标定残差统计 (mm): "
+                f"RMSE_total={rmse_total:.3f}, max={max_error:.3f}, mean={mean_error:.3f}, "
+                f"axis_rmse=[{axis_rmse[0]:.3f}, {axis_rmse[1]:.3f}, {axis_rmse[2]:.3f}]\n"
+            )
 
-        # 计算每个批次的残差
-        batch_statistics = []
-        point_idx = 0
-        for batch in self.calibration_batches:
-            batch_point_count = len(batch['points'])
-            batch_errors = per_point_error[point_idx:point_idx + batch_point_count]
-            batch_rmse = float(np.sqrt(np.mean(batch_errors ** 2)))
-            batch_statistics.append({
-                'batch_index': batch['batch_index'],
-                'description': batch.get('description', ''),
-                'points_count': batch_point_count,
-                'rmse_mm': batch_rmse
-            })
-            point_idx += batch_point_count
-            rospy.loginfo(f"批次 {batch['batch_index'] + 1}: {batch_point_count} 点, RMSE={batch_rmse:.3f}mm")
+            # 计算每个批次的残差
+            batch_statistics = []
+            point_idx = 0
+            for batch in self.calibration_batches:
+                batch_point_count = len(batch['points'])
+                batch_errors = per_point_error[point_idx:point_idx + batch_point_count]
+                batch_rmse = float(np.sqrt(np.mean(batch_errors ** 2)))
+                batch_statistics.append({
+                    'batch_index': batch['batch_index'],
+                    'description': batch.get('description', ''),
+                    'points_count': batch_point_count,
+                    'rmse_mm': batch_rmse
+                })
+                point_idx += batch_point_count
+                rospy.loginfo(f"批次 {batch['batch_index'] + 1}: {batch_point_count} 点, RMSE={batch_rmse:.3f}mm")
 
-        calibration_info = {
-            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-            'num_points_used': len(points_camera),
-            'method': '3D_rigid_body_transform_SVD_multi_batch',
-            'total_batches': len(self.calibration_batches),
-            'batches': batch_statistics,
-            'validation': {
+            calibration_info = {
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'num_points_used': len(points_camera),
+                'method': '3D_rigid_body_transform_SVD_multi_batch',
+                'total_batches': len(self.calibration_batches),
+                'batches': batch_statistics,
+                'validation': {
+                    'rmse_total_mm': rmse_total,
+                    'max_error_mm': max_error,
+                    'mean_error_mm': mean_error,
+                    'rmse_axis_mm': [float(axis_rmse[0]), float(axis_rmse[1]), float(axis_rmse[2])],
+                    'samples': len(points_camera)
+                }
+            }
+            extrinsics = {
+                'description': '新的相机外参: 从相机坐标系到振镜坐标系的变换 (Pg = R * Pc + t)',
+                't_gc_mm': t.flatten().tolist(),
+                'R_gc': R.tolist(),
+                'q_gc_xyzw': Rotation.from_matrix(R).as_quat().tolist()
+            }
+
+            validation_metrics = {
+                'rmse_axis_mm': [float(axis_rmse[0]), float(axis_rmse[1]), float(axis_rmse[2])],
                 'rmse_total_mm': rmse_total,
                 'max_error_mm': max_error,
                 'mean_error_mm': mean_error,
-                'rmse_axis_mm': [float(axis_rmse[0]), float(axis_rmse[1]), float(axis_rmse[2])],
+                'per_point_error_mm': per_point_error.tolist(),
+                'residuals_mm': residuals.tolist(),
                 'samples': len(points_camera)
             }
-        }
-        extrinsics = {
-            'description': '新的相机外参: 从相机坐标系到振镜坐标系的变换 (Pg = R * Pc + t)',
-            't_gc_mm': t.flatten().tolist(),
-            'R_gc': R.tolist(),
-            'q_gc_xyzw': Rotation.from_matrix(R).as_quat().tolist()
-        }
 
-        validation_metrics = {
-            'rmse_axis_mm': [float(axis_rmse[0]), float(axis_rmse[1]), float(axis_rmse[2])],
-            'rmse_total_mm': rmse_total,
-            'max_error_mm': max_error,
-            'mean_error_mm': mean_error,
-            'per_point_error_mm': per_point_error.tolist(),
-            'residuals_mm': residuals.tolist(),
-            'samples': len(points_camera)
-        }
+            galvo_entry = {
+                'id': self.galvo_index,
+                'name': self.galvo_name,
+                'calibration_info': calibration_info,
+                'refined_extrinsics': extrinsics,
+                'active_extrinsics': 'refined',
+                'validation': validation_metrics,
+                'code_limits': {
+                    'x': [int(self.galvo_limits[0][0]), int(self.galvo_limits[0][1])],
+                    'y': [int(self.galvo_limits[1][0]), int(self.galvo_limits[1][1])]
+                },
+                'galvo_range': [int(self.galvo_min), int(self.galvo_max)]
+            }
 
-        galvo_entry = {
-            'id': self.galvo_index,
-            'name': self.galvo_name,
-            'calibration_info': calibration_info,
-            'refined_extrinsics': extrinsics,
-            'active_extrinsics': 'refined',
-            'validation': validation_metrics,
-            'code_limits': {
-                'x': [int(self.galvo_limits[0][0]), int(self.galvo_limits[0][1])],
-                'y': [int(self.galvo_limits[1][0]), int(self.galvo_limits[1][1])]
-            },
-            'galvo_range': [int(self.galvo_min), int(self.galvo_max)]
-        }
-
-        try:
-            existing_data = {}
-            if os.path.exists(self.calibration_result_file):
-                with open(self.calibration_result_file, 'r') as f:
-                    existing_data = yaml.safe_load(f) or {}
-
-            galvos = existing_data.get('galvos', [])
-            updated = False
-            for entry in galvos:
-                if entry.get('id') == self.galvo_index or entry.get('name') == self.galvo_name:
-                    entry.update(galvo_entry)
-                    updated = True
-                    break
-
-            if not updated:
-                galvos.append(galvo_entry)
-
-            existing_data['galvos'] = galvos
-            existing_data['last_updated'] = calibration_info['timestamp']
-
-            with open(self.calibration_result_file, 'w') as f:
-                yaml.dump(existing_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-
-            rospy.loginfo(f"新的三维标定结果已成功保存至: {self.calibration_result_file}\n")
-        except Exception as e:
-            rospy.logerr(f"保存标定文件失败: {e}\n")
+            self._save_calibration_to_yaml(galvo_entry, calibration_info['timestamp'])
 
     def _unproject_to_camera_frame_mm(self, u, v, z_m):
         """辅助方法：将像素和深度（米）反投影为相机坐标系下的三维点（毫米）。"""
@@ -1268,6 +1710,141 @@ class ManualGalvoCalibrationNode:
             rospy.logwarn(f"从振镜码值计算三维点失败: {e}\n")
             return None
 
+    def _save_polynomial_calibration(self, coeffs_x, coeffs_y, poly_metrics, 
+                                     num_points, X_rough, Y_rough, Code_x, Code_y):
+        """保存多项式校正结果到YAML文件"""
+        # 计算每个批次的残差
+        batch_statistics = []
+        point_idx = 0
+        for batch in self.calibration_batches:
+            batch_point_count = len(batch['points'])
+            batch_X = X_rough[point_idx:point_idx + batch_point_count]
+            batch_Y = Y_rough[point_idx:point_idx + batch_point_count]
+            batch_Code_x = Code_x[point_idx:point_idx + batch_point_count]
+            batch_Code_y = Code_y[point_idx:point_idx + batch_point_count]
+            
+            # 计算该批次的预测误差
+            batch_feat = np.zeros((batch_point_count, 6))
+            batch_feat[:, 0] = 1.0
+            batch_feat[:, 1] = batch_X
+            batch_feat[:, 2] = batch_Y
+            batch_feat[:, 3] = batch_X ** 2
+            batch_feat[:, 4] = batch_X * batch_Y
+            batch_feat[:, 5] = batch_Y ** 2
+            
+            pred_x = batch_feat @ coeffs_x
+            pred_y = batch_feat @ coeffs_y
+            errors_x = batch_Code_x - pred_x
+            errors_y = batch_Code_y - pred_y
+            batch_rmse = float(np.sqrt(np.mean(errors_x ** 2 + errors_y ** 2)))
+            
+            batch_statistics.append({
+                'batch_index': batch['batch_index'],
+                'description': batch.get('description', ''),
+                'points_count': batch_point_count,
+                'rmse_code': batch_rmse
+            })
+            point_idx += batch_point_count
+            rospy.loginfo(f"批次 {batch['batch_index'] + 1}: {batch_point_count} 点, RMSE={batch_rmse:.2f} code")
+        
+        calibration_info = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'num_points_used': num_points,
+            'method': 'polynomial_correction_2nd_order',
+            'total_batches': len(self.calibration_batches),
+            'batches': batch_statistics,
+            'validation': {
+                'rmse_x_code': poly_metrics['rmse_x'],
+                'rmse_y_code': poly_metrics['rmse_y'],
+                'max_error_x_code': poly_metrics['max_error_x'],
+                'max_error_y_code': poly_metrics['max_error_y'],
+                'samples': num_points
+            }
+        }
+        
+        # 多项式校正系数
+        # 多项式形式: Code = C0 + C1*X + C2*Y + C3*X^2 + C4*X*Y + C5*Y^2
+        poly_correction = {
+            'description': '二阶多项式校正: Code = C0 + C1*X + C2*Y + C3*X^2 + C4*X*Y + C5*Y^2',
+            'coefficients_x': coeffs_x.tolist(),  # [C0, C1, C2, C3, C4, C5] for X
+            'coefficients_y': coeffs_y.tolist(),  # [C0, C1, C2, C3, C4, C5] for Y
+            'input_units': 'mm',  # X, Y的单位是毫米
+            'output_units': 'code',  # 输出是振镜码值
+            'order': 2,
+            'validation': poly_metrics
+        }
+        
+        galvo_entry = {
+            'id': self.galvo_index,
+            'name': self.galvo_name,
+            'calibration_info': calibration_info,
+            'poly_correction': poly_correction,
+            'active_correction': 'poly_correction',
+            'code_limits': {
+                'x': [int(self.galvo_limits[0][0]), int(self.galvo_limits[0][1])],
+                'y': [int(self.galvo_limits[1][0]), int(self.galvo_limits[1][1])]
+            },
+            'galvo_range': [int(self.galvo_min), int(self.galvo_max)]
+        }
+        
+        rospy.loginfo("========================================")
+        rospy.loginfo("准备保存多项式校正结果...")
+        rospy.loginfo(f"振镜ID: {self.galvo_index}, 名称: {self.galvo_name}")
+        rospy.loginfo(f"标定点数: {num_points}")
+        rospy.loginfo(f"保存路径: {self.calibration_result_file}")
+        rospy.loginfo("========================================")
+        
+        # 保存到YAML文件
+        self._save_calibration_to_yaml(galvo_entry, calibration_info['timestamp'])
+
+    def _save_calibration_to_yaml(self, galvo_entry, timestamp):
+        """保存标定结果到YAML文件的通用方法"""
+        try:
+            # 确保目录存在
+            result_dir = os.path.dirname(self.calibration_result_file)
+            if result_dir and not os.path.exists(result_dir):
+                os.makedirs(result_dir, exist_ok=True)
+                rospy.loginfo(f"创建标定结果目录: {result_dir}")
+            
+            existing_data = {}
+            if os.path.exists(self.calibration_result_file):
+                try:
+                    with open(self.calibration_result_file, 'r', encoding='utf-8') as f:
+                        existing_data = yaml.safe_load(f) or {}
+                    rospy.loginfo(f"读取现有标定文件: {self.calibration_result_file}")
+                except Exception as e:
+                    rospy.logwarn(f"读取现有标定文件失败，将创建新文件: {e}")
+                    existing_data = {}
+
+            galvos = existing_data.get('galvos', [])
+            updated = False
+            for entry in galvos:
+                if entry.get('id') == self.galvo_index or entry.get('name') == self.galvo_name:
+                    rospy.loginfo(f"更新现有振镜配置: id={self.galvo_index}, name={self.galvo_name}")
+                    entry.update(galvo_entry)
+                    updated = True
+                    break
+
+            if not updated:
+                rospy.loginfo(f"添加新振镜配置: id={self.galvo_index}, name={self.galvo_name}")
+                galvos.append(galvo_entry)
+
+            existing_data['galvos'] = galvos
+            existing_data['last_updated'] = timestamp
+
+            # 保存到文件，使用自定义 Dumper 以保持格式一致
+            with open(self.calibration_result_file, 'w', encoding='utf-8') as f:
+                yaml.dump(existing_data, f, Dumper=FlowStyleDumper, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+            rospy.loginfo(f"========================================")
+            rospy.loginfo(f"标定结果已成功保存至: {self.calibration_result_file}")
+            rospy.loginfo(f"保存时间: {timestamp}")
+            rospy.loginfo(f"========================================\n")
+        except Exception as e:
+            rospy.logerr(f"保存标定文件失败: {e}")
+            import traceback
+            rospy.logerr(traceback.format_exc())
+
     def find_rigid_transform_3d(self, points_A, points_B):
         """使用SVD算法计算从点云A到点云B的三维刚体变换（旋转R和平移t）。"""
         if points_A.shape != points_B.shape:
@@ -1292,6 +1869,47 @@ class ManualGalvoCalibrationNode:
         t = centroid_B.T - R @ centroid_A.T
         return R, t.reshape(3, 1)
 
+    def fit_polynomial_correction(self, X_rough, Y_rough, Code_x, Code_y):
+        """使用二阶多项式拟合振镜码值校正"""
+        n_points = len(X_rough)
+        if n_points < 6:
+            raise ValueError(f"多项式拟合至少需要6个点，当前只有 {n_points} 个。建议采集9点或16点矩阵。\n")
+        
+        # 构建特征矩阵： [1, X, Y, X^2, X*Y, Y^2]
+        feat = np.zeros((n_points, 6), dtype=np.float64)
+        feat[:, 0] = 1.0
+        feat[:, 1] = X_rough
+        feat[:, 2] = Y_rough
+        feat[:, 3] = X_rough ** 2
+        feat[:, 4] = X_rough * Y_rough
+        feat[:, 5] = Y_rough ** 2
+        
+        # 使用最小二乘法求解：Code = feat @ coeffs
+        cx, residuals_x, rank_x, s_x = np.linalg.lstsq(feat, Code_x, rcond=None)
+        cy, residuals_y, rank_y, s_y = np.linalg.lstsq(feat, Code_y, rcond=None)
+        
+        # 计算拟合误差
+        pred_x = feat @ cx
+        pred_y = feat @ cy
+        err_x = Code_x - pred_x
+        err_y = Code_y - pred_y
+        rmse_x = np.sqrt(np.mean(err_x ** 2))
+        rmse_y = np.sqrt(np.mean(err_y ** 2))
+        max_err_x = np.max(np.abs(err_x))
+        max_err_y = np.max(np.abs(err_y))
+        
+        rospy.loginfo(f"多项式拟合结果:")
+        rospy.loginfo(f"  X方向: RMSE={rmse_x:.2f} code, MaxError={max_err_x:.2f} code")
+        rospy.loginfo(f"  Y方向: RMSE={rmse_y:.2f} code, MaxError={max_err_y:.2f} code")
+        
+        return cx, cy, {
+            'rmse_x': float(rmse_x),
+            'rmse_y': float(rmse_y),
+            'max_error_x': float(max_err_x),
+            'max_error_y': float(max_err_y),
+            'residuals_x': err_x.tolist(),
+            'residuals_y': err_y.tolist()
+        }
 
     def reset_calibration(self):
         """重置所有标定数据（包括所有批次）"""
@@ -1360,8 +1978,44 @@ class ManualGalvoCalibrationNode:
             y_offset += 25
 
         # 黑色圆圈目标（带ID和置信度）
+        # 如果正在进行测试，显示测试目标
+        if self.calibration_state == "TESTING" and len(self.test_targets) > 0:
+            # 绘制测试目标
+            for i, target in enumerate(self.test_targets):
+                center = target['center']
+                radius = target.get('radius', 20)
+                circle_id = target.get('id', i)
+                
+                is_current = (self.current_target and 
+                             i == self.current_target_index)
+                is_tested = i in self.tested_target_indices
+                
+                # 颜色：当前目标=红色，已瞄准过=灰色，未瞄准=绿色
+                if is_current:
+                    color = (0, 0, 255)  # 红色（BGR）
+                    thickness = 3
+                elif is_tested:
+                    color = (128, 128, 128)  # 灰色（BGR）
+                    thickness = 2
+                else:
+                    color = (0, 255, 0)  # 绿色（BGR）
+                    thickness = 2
+                
+                cv2.circle(result, (int(center[0]), int(center[1])), int(radius), color, thickness)
+                cv2.circle(result, (int(center[0]), int(center[1])), 3, color, -1)
+                
+                # 标签：显示ID和状态
+                label = f"Test{i+1}"
+                if is_current:
+                    label += " [CURRENT]"
+                elif is_tested:
+                    label += " [TESTED]"
+                
+                cv2.putText(result, label, (int(center[0] + radius + 5), int(center[1] - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        
         # 如果正在进行标定，优先显示 selected_targets（固定位置）
-        if self.calibration_state in ["SELECTING", "MANUAL_AIMING"] and len(self.selected_targets) > 0:
+        elif self.calibration_state in ["SELECTING", "MANUAL_AIMING"] and len(self.selected_targets) > 0:
             # 绘制标定目标（来自 selected_targets，固定位置）
             for i, target in enumerate(self.selected_targets):
                 center = target['center']

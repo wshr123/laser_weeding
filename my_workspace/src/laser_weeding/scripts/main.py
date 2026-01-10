@@ -64,6 +64,10 @@ class LaserWeedingNode:
             self.device = rospy.get_param('~device', '0')
             self.weed_class_id = rospy.get_param('~weed_class_id', 0)
             self.confidence_threshold = rospy.get_param('~confidence_threshold', 0.3)
+            # 检测模式参数
+            self.detection_mode = rospy.get_param('~detection_mode', 'bbox')
+            # 跟踪器类型参数
+            self.tracker_type = rospy.get_param('~tracker_type', 'custom')
 
             # 预测参数
             self.total_delay = rospy.get_param('~total_delay', 0.08)
@@ -165,7 +169,8 @@ class LaserWeedingNode:
                     crop_class_id=1,
                     confidence_threshold=self.confidence_threshold,
                     device=self.device,
-                    tracker_type='custom'
+                    tracker_type=self.tracker_type,
+                    detection_mode=self.detection_mode
                 )
                 rospy.loginfo(f' {self.model_type.upper()} loading model')
             except Exception as e:
@@ -462,15 +467,21 @@ class LaserWeedingNode:
                 target_point = self._get_target_point(target_info)
                 if target_point:
                     self.update_position_history(target_point, current_time, galvo_idx)
+                    # 保存最后已知的bbox和位置，用于盲打模式
+                    if 'bbox' in target_info:
+                        current_target['last_known_bbox'] = target_info['bbox']
+                    current_target['last_known_point'] = target_point
                 
                 # 检查是否达到瞄准时间
                 elapsed = current_time - current_target['start_time']
                 if elapsed >= self.aiming_time:
+                    # 初始化盲打模式标志（进入 FIRING 时默认为 False，表示还未进入盲打模式）
+                    current_target['blind_mode'] = False
                     self.change_galvo_state(galvo_idx, SystemState.FIRING)
                     rospy.loginfo(f"Galvo {galvo_idx}: 开始照射目标 {target_id}")
             
             elif state == SystemState.FIRING:
-                # 照射状态：持续跟踪并照射
+                # 照射状态：持续跟踪并照射（支持盲打模式）
                 current_target = self.galvo_current_targets[galvo_idx]
                 if not current_target:
                     self.change_galvo_state(galvo_idx, SystemState.IDLE)
@@ -478,12 +489,91 @@ class LaserWeedingNode:
                 
                 target_id = current_target['id']
                 
-                # 继续更新位置（激光照射时也要跟踪，使用对靶点）
-                if target_id in self.all_targets:
+                # ==================== 盲打模式实现 ====================
+                # 1. 检查是否有视觉检测结果（排除虚拟目标）
+                has_visual_contact = target_id in self.all_targets and not self.all_targets[target_id].get('is_virtual', False)
+                
+                if has_visual_contact:
+                    # A. 有检测结果：正常执行 Predict + Update
+                    # 如果之前在盲打模式，现在检测框恢复，退出盲打模式
+                    if current_target.get('blind_mode', False):
+                        current_target['blind_mode'] = False
+                        rospy.logdebug(f"Galvo {galvo_idx}: 目标 {target_id} 检测框恢复，退出盲打模式")
+                    
                     target_info = self.all_targets[target_id]
                     target_point = self._get_target_point(target_info)
+                    
                     if target_point:
+                        # 更新位置历史（会触发 Predict + Update）
                         self.update_position_history(target_point, current_time, galvo_idx)
+                        # 保存最后已知位置和bbox，以防下一帧丢失
+                        current_target['last_known_point'] = target_point
+                        if 'bbox' in target_info:
+                            current_target['last_known_bbox'] = target_info['bbox']
+                else:
+                    # B. 无检测结果（盲区）：仅执行 Predict（不执行 Update）
+                    # 进入或保持盲打模式
+                    if not current_target.get('blind_mode', False):
+                        # 首次进入盲打模式，标记状态
+                        current_target['blind_mode'] = True
+                        rospy.logdebug(f"Galvo {galvo_idx}: 目标 {target_id} 进入盲打模式")
+                    
+                    # 使用卡尔曼滤波器的纯预测模式
+                    predicted_pos = self.predict_position(0.0, galvo_idx, use_measurement=False)
+                    
+                    # 如果预测失败，尝试使用最后已知位置
+                    if not predicted_pos and 'last_known_point' in current_target:
+                        predicted_pos = current_target['last_known_point']
+                    
+                    if predicted_pos:
+                        # 关键技巧：创建/更新虚拟目标对象并注入到 all_targets
+                        # 这样后续的控制和显示逻辑可以正常工作
+                        virtual_target = {
+                            'bbox': current_target.get('last_known_bbox', [0, 0, 20, 20]),  # 使用最后已知的bbox或默认值
+                            'center': predicted_pos,
+                            'target_point': predicted_pos,
+                            'confidence': 0.0,  # 虚拟目标置信度为0
+                            'last_seen': current_time,
+                            'galvo_index': galvo_idx,
+                            'in_range': True,
+                            'is_virtual': True,  # 标记为虚拟目标
+                            'processed': False,
+                            'stable_frames': 0
+                        }
+                        
+                        # 如果有最后已知的bbox，使用它；否则基于预测位置生成一个
+                        if 'last_known_bbox' in current_target:
+                            virtual_target['bbox'] = current_target['last_known_bbox']
+                        else:
+                            # 基于预测位置生成一个默认大小的bbox
+                            x, y = predicted_pos
+                            default_w, default_h = 30, 30  # 默认bbox大小
+                            virtual_target['bbox'] = [x - default_w/2, y - default_h/2, default_w, default_h]
+                        
+                        # 将虚拟目标注入到 all_targets（仅在盲打模式时）
+                        self.all_targets[target_id] = virtual_target
+                        
+                        # 更新目标位置（用于控制）
+                        clamped_px = float(np.clip(predicted_pos[0], 0, self.image_width - 1))
+                        clamped_py = float(np.clip(predicted_pos[1], 0, self.image_height - 1))
+                        
+                        with self.position_lock:
+                            self.galvo_pixel_targets[galvo_idx] = [clamped_px, clamped_py]
+                        
+                        # 转换为振镜坐标
+                        galvo_result = self.coordinate_transform.pixel_to_galvo_code(
+                            clamped_px, clamped_py,
+                            self.image_width, self.image_height,
+                            galvo_index=galvo_idx
+                        )
+                        
+                        if galvo_result:
+                            galvo_x, galvo_y = self.clamp_to_galvo_limits(galvo_idx, galvo_result[0], galvo_result[1])
+                            with self.position_lock:
+                                self.target_galvo_positions[galvo_idx] = [galvo_x, galvo_y]
+                                self.active_galvo_index = galvo_idx
+                
+                # ==================== 盲打模式结束 ====================
                 
                 # 检查是否达到照射时间
                 elapsed = current_time - self.galvo_state_start_times[galvo_idx]
@@ -499,7 +589,15 @@ class LaserWeedingNode:
                     if not was_already_processed and 0 <= galvo_idx < self.galvo_count:
                         self.galvo_cumulative_processed[galvo_idx] += 1
                     
-                    rospy.loginfo(f"Galvo {galvo_idx}: 完成照射目标 {target_id}")
+                    # 清除盲打模式标志
+                    if 'blind_mode' in current_target:
+                        blind_mode_used = current_target['blind_mode']
+                        if blind_mode_used:
+                            rospy.loginfo(f"Galvo {galvo_idx}: 完成照射目标 {target_id} (盲打模式)")
+                        else:
+                            rospy.loginfo(f"Galvo {galvo_idx}: 完成照射目标 {target_id}")
+                    else:
+                        rospy.loginfo(f"Galvo {galvo_idx}: 完成照射目标 {target_id}")
                     
                     # 清除当前目标并返回空闲
                     self.galvo_current_targets[galvo_idx] = None
@@ -548,14 +646,40 @@ class LaserWeedingNode:
             rospy.logerr(f"Error in laser_mode_callback: {e}")
 
     def depth_query_func(self, u, v):
-        """查询像素(u,v)的深度，单位：米。用于 coordinate_transform 中"""
+        """
+        查询像素(u,v)的深度，单位：米。用于 coordinate_transform 中
+        使用邻域中值法提高鲁棒性，避免单个像素噪声影响
+        """
         with self.depth_image_lock:
             if self.depth_image is None:
                 return None
             H, W = self.depth_image.shape[:2]
             if u < 0 or v < 0 or u >= W or v >= H:
                 return None
-            z = float(self.depth_image[int(round(v)), int(round(u))])
+
+            # 使用邻域中值法（3x3窗口）提高鲁棒性
+            radius = 1  # 邻域半径（3x3窗口）
+            y_int = int(round(v))
+            x_int = int(round(u))
+
+            # 边界检查
+            y_min = max(0, y_int - radius)
+            y_max = min(H, y_int + radius + 1)
+            x_min = max(0, x_int - radius)
+            x_max = min(W, x_int + radius + 1)
+
+            # 提取邻域
+            neighborhood = self.depth_image[y_min:y_max, x_min:x_max]
+
+            # 过滤有效深度值（有限且>0）
+            valid_depths = neighborhood[np.isfinite(neighborhood) & (neighborhood > 0)]
+
+            if len(valid_depths) == 0:
+                return None
+
+            # 使用中值（比均值更鲁棒，不受异常值影响）
+            z = float(np.median(valid_depths))
+
             if not np.isfinite(z) or z <= 0:
                 return None
             return z
@@ -779,15 +903,36 @@ class LaserWeedingNode:
                     self.galvo_cumulative_detected[galvo_index] += 1
                     self.counted_targets.add(track_id)
             
-            self.all_targets[track_id].update({
-                'bbox': bbox,
-                'center': [cx, cy],  # bbox中心（用于跟踪）
-                'target_point': target_point,  # 对靶点（用于激光瞄准）
-                'confidence': confidence,
-                'last_seen': current_time,
-                'galvo_index': galvo_index,
-                'in_range': in_range
-            })
+            # 检查目标是否正在 FIRING 状态且是虚拟目标，且处于盲打模式
+            # 只有在盲打模式时，才阻止覆盖虚拟目标（因为此时应该使用预测）
+            # 如果检测框恢复（不在盲打模式），应该允许覆盖虚拟目标
+            is_firing_blind_mode = False
+            if track_id in self.all_targets:
+                existing_target = self.all_targets[track_id]
+                if existing_target.get('is_virtual', False):
+                    # 检查是否有振镜正在 FIRING 这个目标，且处于盲打模式
+                    for idx in range(self.galvo_count):
+                        if (self.galvo_states[idx] == SystemState.FIRING and
+                            self.galvo_current_targets[idx] and
+                            self.galvo_current_targets[idx].get('id') == track_id):
+                            # 检查是否在盲打模式
+                            if self.galvo_current_targets[idx].get('blind_mode', False):
+                                is_firing_blind_mode = True
+                                break
+            
+            # 如果目标正在 FIRING 且处于盲打模式，不覆盖虚拟目标（保持预测模式）
+            # 否则（检测框恢复），允许覆盖虚拟目标，使用真实检测
+            if not is_firing_blind_mode:
+                self.all_targets[track_id].update({
+                    'bbox': bbox,
+                    'center': [cx, cy],  # bbox中心（用于跟踪）
+                    'target_point': target_point,  # 对靶点（用于激光瞄准）
+                    'confidence': confidence,
+                    'last_seen': current_time,
+                    'galvo_index': galvo_index,
+                    'in_range': in_range,
+                    'is_virtual': False  # 清除虚拟标记（如果有真实检测）
+                })
 
             # 检查目标是否被处理
             if track_id in self.processed_targets:
@@ -799,10 +944,23 @@ class LaserWeedingNode:
         # 更新各振镜的目标队列
         self._update_galvo_queues(current_time)
 
-        # 清理超时目标
+        # 清理超时目标（但保护 FIRING 状态中的虚拟目标）
         to_remove = []
         for tid, tinfo in list(self.all_targets.items()):
             if tid not in current_frame_ids:
+                # 检查目标是否正在 FIRING 状态
+                is_firing = False
+                for idx in range(self.galvo_count):
+                    if (self.galvo_states[idx] == SystemState.FIRING and
+                        self.galvo_current_targets[idx] and
+                        self.galvo_current_targets[idx].get('id') == tid):
+                        is_firing = True
+                        break
+                
+                # 如果目标正在 FIRING，不删除（即使超时也要等到 FIRING 结束）
+                if is_firing:
+                    continue
+                
                 timeout = self.target_timeout * (3 if tid in self.processed_targets else 1)
                 if current_time - tinfo.get('last_seen', current_time) > timeout:
                     to_remove.append(tid)
@@ -927,8 +1085,18 @@ class LaserWeedingNode:
                         self.target_galvo_positions[galvo_index] = [galvo_x, galvo_y]
                         self.active_galvo_index = galvo_index
 
-    def predict_position(self, dt, galvo_index):
-        """预测未来位置（使用对应振镜的卡尔曼滤波器和位置历史）"""
+    def predict_position(self, dt, galvo_index, use_measurement=True):
+        """
+        预测未来位置（使用对应振镜的卡尔曼滤波器和位置历史）
+        
+        Args:
+            dt: 预测时间间隔（秒）
+            galvo_index: 振镜索引
+            use_measurement: 是否使用测量值进行校正（True=Predict+Update, False=Predict Only）
+        
+        Returns:
+            预测位置 [x, y] 或 None
+        """
         # 使用对应振镜的位置历史
         if galvo_index < len(self.galvo_position_histories):
             relevant_history = list(self.galvo_position_histories[galvo_index])
@@ -949,13 +1117,18 @@ class LaserWeedingNode:
             kf = self.kalman_filters[galvo_index]
             if kf is not None:
                 try:
-                    current_pos = relevant_history[-1]['position']
-                    measurement = np.array([[current_pos[0]], [current_pos[1]]], dtype=np.float32)
-
-                    kf.correct(measurement)
-                    kf.predict()
-
-                    state = kf.statePost
+                    if use_measurement:
+                        # 标准模式：Predict + Update（有测量值）
+                        current_pos = relevant_history[-1]['position']
+                        measurement = np.array([[current_pos[0]], [current_pos[1]]], dtype=np.float32)
+                        kf.correct(measurement)
+                        kf.predict()
+                        state = kf.statePost
+                    else:
+                        # 盲打模式：仅 Predict（无测量值，纯预测）
+                        kf.predict()
+                        state = kf.statePre  # 预测后的状态在 statePre 中
+                    
                     pred_x = state[0, 0] + state[2, 0] * dt
                     pred_y = state[1, 0] + state[3, 0] * dt
 
@@ -1051,58 +1224,67 @@ class LaserWeedingNode:
             self.tracking_active = True
             self.set_laser(True)
 
-    def calculate_spiral_radius_from_depth(self, depth_m: float, galvo_idx: int = 0) -> int:
+    def calculate_spiral_radius_from_bbox(self, bbox: List[float], galvo_idx: int = 0) -> int:
         """
-        根据深度值计算螺旋线半径（振镜代码）
+        根据bounding box计算螺旋线半径（振镜代码）
+        螺旋线半径 = bounding box短边长的一半
         
         参数:
-            depth_m: 深度值（米）
+            bbox: bounding box [x, y, w, h]（像素）
             galvo_idx: 振镜索引
             
         返回:
             螺旋线半径（振镜代码）
         """
-        if depth_m is None or depth_m <= 0:
-            # 如果深度无效，使用默认值
-            rospy.logwarn("Invalid depth for spiral calculation, using default radius")
+        if bbox is None or len(bbox) < 4:
+            # 如果bbox无效，使用默认值
+            rospy.logwarn("Invalid bbox for spiral calculation, using default radius")
             return 6000
         
         try:
-            # 获取振镜配置
-            profile = self.coordinate_transform._get_profile(galvo_idx)
-            galvo_params = profile.galvo_params
-            limits = profile.axis_angle_limits
+            x, y, w, h = bbox[0], bbox[1], bbox[2], bbox[3]
             
-            # 计算2cm直径对应的角度（半径1cm）
-            radius_mm = self.spiral_diameter_mm / 2.0  # 半径（毫米）
-            depth_mm = depth_m * 1000.0  # 深度转换为毫米
+            # 计算短边长的一半（像素）
+            short_side = min(w, h)
+            radius_px = short_side / 2.0
             
-            # 在深度depth_mm下，半径radius_mm对应的角度
-            # tan(theta) = radius_mm / depth_mm
-            theta_rad = np.arctan2(radius_mm, depth_mm)
+            # 将像素半径转换为振镜代码
+            # 使用坐标变换：将像素坐标转换为振镜代码
+            # 计算bbox中心点和半径对应的两个点（中心点和中心+半径点）
+            center_x = x + w / 2.0
+            center_y = y + h / 2.0
             
-            # 将角度转换为振镜代码
-            # 使用与angles_to_codes相同的逻辑
-            theta_x_deg = np.degrees(theta_rad) * galvo_params.get('scale_x', 1.0) + galvo_params.get('bias_x', 0.0)
-            theta_y_deg = np.degrees(theta_rad) * galvo_params.get('scale_y', 1.0) + galvo_params.get('bias_y', 0.0)
+            # 计算半径对应的点（在短边方向上）
+            if w <= h:
+                # 宽度更短，在x方向扩展
+                radius_point_x = center_x + radius_px
+                radius_point_y = center_y
+            else:
+                # 高度更短，在y方向扩展
+                radius_point_x = center_x
+                radius_point_y = center_y + radius_px
             
-            # 归一化到-1到1范围（与angles_to_codes逻辑一致）
-            def to_norm(angle_deg: float, neg_limit: float, pos_limit: float) -> float:
-                limit = pos_limit if angle_deg >= 0 else neg_limit
-                return angle_deg / limit if abs(limit) > 1e-9 else 0.0
+            # 将中心点和半径点转换为振镜代码
+            center_code = self.coordinate_transform.pixel_to_galvo_code(
+                center_x, center_y,
+                self.image_width, self.image_height,
+                galvo_index=galvo_idx
+            )
+            radius_code = self.coordinate_transform.pixel_to_galvo_code(
+                radius_point_x, radius_point_y,
+                self.image_width, self.image_height,
+                galvo_index=galvo_idx
+            )
             
-            norm_x = to_norm(theta_x_deg, limits['x_minus'], limits['x_plus'])
-            norm_y = to_norm(theta_y_deg, limits['y_minus'], limits['y_plus'])
+            if center_code is None or radius_code is None:
+                rospy.logwarn("Failed to convert pixel to galvo code for spiral radius, using default")
+                return 6000
             
-            # 取较小的值以确保螺旋线在范围内（圆形螺旋线需要同时满足x和y方向）
-            norm_radius = min(abs(norm_x), abs(norm_y))
-            
-            # 转换为振镜代码（与angles_to_codes逻辑一致）
-            base_code = np.clip(norm_radius * profile.max_code, -profile.max_code, profile.max_code)
-            
-            # 应用code_scale（取x和y的平均值，或使用较小的值以确保在范围内）
-            # 使用x方向的缩放作为参考
-            code_radius = int(base_code * profile.code_scale[0])
+            # 计算振镜代码中的半径（欧氏距离）
+            code_radius = int(np.hypot(
+                radius_code[0] - center_code[0],
+                radius_code[1] - center_code[1]
+            ))
             
             # 限制范围，确保合理（最小100，最大20000）
             code_radius = max(100, min(code_radius, 20000))
@@ -1110,36 +1292,46 @@ class LaserWeedingNode:
             return code_radius
             
         except Exception as e:
-            rospy.logwarn(f"Error calculating spiral radius from depth: {e}, using default")
+            rospy.logwarn(f"Error calculating spiral radius from bbox: {e}, using default")
             return 6000
 
-    def configure_spiral_for_target(self, galvo_idx: int, pixel_x: float = None, pixel_y: float = None):
+    def configure_spiral_for_target(self, galvo_idx: int, target_id: int = None):
         """
-        根据目标点的深度配置螺旋参数
+        根据目标的bounding box配置螺旋参数
+        螺旋线半径 = bounding box短边长的一半
         
         参数:
             galvo_idx: 振镜索引
-            pixel_x: 目标像素x坐标（可选，用于查询深度）
-            pixel_y: 目标像素y坐标（可选，用于查询深度）
+            target_id: 目标ID（可选，如果不提供则从galvo_current_targets获取）
         """
         if self.laser_mode != 'spiral' or not self.galvo_controller:
             return
         
         try:
-            # 获取目标点的深度
-            depth_m = None
-            if pixel_x is not None and pixel_y is not None:
-                depth_m = self.depth_query_func(pixel_x, pixel_y)
+            # 获取目标信息
+            target_info = None
+            if target_id is not None and target_id in self.all_targets:
+                target_info = self.all_targets[target_id]
+            elif self.galvo_current_targets[galvo_idx]:
+                current_target = self.galvo_current_targets[galvo_idx]
+                target_id = current_target.get('id')
+                if target_id and target_id in self.all_targets:
+                    target_info = self.all_targets[target_id]
             
-            # 如果无法获取深度，尝试使用当前目标的位置
-            if depth_m is None or depth_m <= 0:
-                target_info = self.galvo_current_targets[galvo_idx]
-                if target_info and 'center' in target_info:
-                    center = target_info['center']
-                    depth_m = self.depth_query_func(center[0], center[1])
+            # 获取bbox
+            bbox = None
+            if target_info and 'bbox' in target_info:
+                bbox = target_info['bbox']
+            elif self.galvo_current_targets[galvo_idx]:
+                # 尝试从last_known_bbox获取
+                bbox = self.galvo_current_targets[galvo_idx].get('last_known_bbox')
             
-            # 计算螺旋半径
-            spiral_radius = self.calculate_spiral_radius_from_depth(depth_m, galvo_idx)
+            if bbox is None or len(bbox) < 4:
+                rospy.logwarn(f"Galvo {galvo_idx}: 无法获取目标bbox，使用默认螺旋参数")
+                return
+            
+            # 计算螺旋半径（基于bbox短边长的一半）
+            spiral_radius = self.calculate_spiral_radius_from_bbox(bbox, galvo_idx)
             
             # 计算螺旋间距（基于半径的百分比）
             spiral_spacing = spiral_radius * self.spiral_spacing_ratio
@@ -1152,7 +1344,9 @@ class LaserWeedingNode:
                     dwell_us=self.spiral_point_delay_us,
                     angle_step=self.spiral_angle_step
                 )
-                rospy.logdebug(f"Galvo {galvo_idx}: 配置螺旋参数 - 半径={spiral_radius}, 间距={spiral_spacing:.1f}, 深度={depth_m*1000 if depth_m else None:.1f}mm")
+                x, y, w, h = bbox[0], bbox[1], bbox[2], bbox[3]
+                short_side = min(w, h)
+                rospy.logdebug(f"Galvo {galvo_idx}: 配置螺旋参数 - 半径={spiral_radius}, 间距={spiral_spacing:.1f}, bbox短边={short_side:.1f}px")
         
         except Exception as e:
             rospy.logwarn(f"Failed to configure spiral for galvo {galvo_idx}: {e}")
@@ -1167,19 +1361,9 @@ class LaserWeedingNode:
                     # 选择对应的振镜并控制其激光
                     if self.galvo_controller.select_galvo(galvo_idx):
                         if enable:
-                            # 如果是螺旋模式，先根据深度配置螺旋参数
+                            # 如果是螺旋模式，先根据bbox配置螺旋参数
                             if self.laser_mode == 'spiral':
-                                # 获取当前目标的位置
-                                target_pixel = self.galvo_pixel_targets[galvo_idx]
-                                if target_pixel and target_pixel[0] is not None:
-                                    self.configure_spiral_for_target(
-                                        galvo_idx,
-                                        target_pixel[0],
-                                        target_pixel[1]
-                                    )
-                                else:
-                                    # 如果没有目标位置，使用默认配置
-                                    rospy.logdebug(f"Galvo {galvo_idx}: 无目标位置，使用默认螺旋参数")
+                                self.configure_spiral_for_target(galvo_idx)
                             
                             self.galvo_controller.send_command("LASER:ON")
                             rospy.logdebug(f"Galvo {galvo_idx}: 激光开启 (模式: {self.laser_mode})")
@@ -1194,6 +1378,8 @@ class LaserWeedingNode:
 
     def set_laser(self, enable):
         """控制激光（保留用于兼容，后续移除）"""
+        if not hasattr(self, 'laser_on'):
+            self.laser_on = False
         if self.laser_on != enable:
             self.laser_on = enable
 
@@ -1238,6 +1424,9 @@ class LaserWeedingNode:
                     current_state = self.galvo_states[idx]
                     break
             
+            # 检查是否为虚拟目标（盲打模式）
+            is_virtual = target_info.get('is_virtual', False)
+            
             # 根据状态设置颜色和标签
             if is_processed:
                 color = (128, 128, 128)  # 灰色：已处理
@@ -1245,8 +1434,13 @@ class LaserWeedingNode:
                 thickness = 1
             elif active_galvo_idx is not None:
                 if current_state == SystemState.FIRING:
-                    color = (0, 0, 255)  # 红色：激光照射
-                    label = f"ID:{track_id} [G{active_galvo_idx} laser]"
+                    if is_virtual:
+                        # 虚拟目标（盲打模式）：使用虚线框或特殊颜色
+                        color = (255, 0, 255)  # 品红色：盲打模式
+                        label = f"ID:{track_id} [G{active_galvo_idx} BLIND]"
+                    else:
+                        color = (0, 0, 255)  # 红色：激光照射（有检测）
+                        label = f"ID:{track_id} [G{active_galvo_idx} laser]"
                 else:
                     color = (0, 255, 255)  # 黄色：跟踪中
                     label = f"ID:{track_id} [G{active_galvo_idx} tracking]"
@@ -1258,14 +1452,31 @@ class LaserWeedingNode:
                 thickness = 1
 
             # 绘制检测框
-            cv2.rectangle(result, (int(x), int(y)),
-                          (int(x + w), int(y + h)), color, thickness)
+            if is_virtual:
+                # 虚拟目标：使用虚线框（通过绘制多个小线段模拟虚线）
+                line_length = 5
+                gap_length = 3
+                # 上边
+                for px in range(int(x), int(x + w), line_length + gap_length):
+                    cv2.line(result, (px, int(y)), (min(px + line_length, int(x + w)), int(y)), color, thickness)
+                # 下边
+                for px in range(int(x), int(x + w), line_length + gap_length):
+                    cv2.line(result, (px, int(y + h)), (min(px + line_length, int(x + w)), int(y + h)), color, thickness)
+                # 左边
+                for py in range(int(y), int(y + h), line_length + gap_length):
+                    cv2.line(result, (int(x), py), (int(x), min(py + line_length, int(y + h))), color, thickness)
+                # 右边
+                for py in range(int(y), int(y + h), line_length + gap_length):
+                    cv2.line(result, (int(x + w), py), (int(x + w), min(py + line_length, int(y + h))), color, thickness)
+            else:
+                # 真实目标：使用实线框
+                cv2.rectangle(result, (int(x), int(y)),
+                            (int(x + w), int(y + h)), color, thickness)
             cv2.circle(result, (int(center[0]), int(center[1])), 3, color, -1)
             cv2.putText(result, label, (int(x), int(y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         # 绘制所有振镜的激光瞄准位置
-        previous_profile = getattr(self.coordinate_transform, 'active_profile_index', None) if self.coordinate_transform else None
         legend_entries = []
         palette = [
             (255, 170, 0),
@@ -1282,10 +1493,10 @@ class LaserWeedingNode:
 
                 if self.coordinate_transform and self.use_reverse_projection:
                     try:
-                        self.coordinate_transform.set_active_galvo_profile(idx)
                         galvo_pixel = self.coordinate_transform.galvo_code_to_pixel(
                             active_pos[0], active_pos[1],
-                            self.image_width, self.image_height
+                            self.image_width, self.image_height,
+                            galvo_index=idx
                         )
                     except Exception as exc:
                         rospy.logdebug(f"Failed reverse transform for galvo {idx}: {exc}")
@@ -1349,12 +1560,6 @@ class LaserWeedingNode:
             rospy.logdebug(f"Failed to draw galvo position: {e}")
             cv2.putText(result, "GALVO DISPLAY ERROR", (10, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        finally:
-            if previous_profile is not None and self.coordinate_transform:
-                try:
-                    self.coordinate_transform.set_active_galvo_profile(previous_profile)
-                except Exception:
-                    pass
 
         # 显示系统整体状态（统计各振镜状态）
         states_summary = f"Galvo States: "

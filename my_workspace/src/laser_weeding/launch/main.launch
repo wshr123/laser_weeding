@@ -65,7 +65,7 @@
 
         <!-- 激光控制 -->
         <param name="aiming_time" value="0.15" />
-        <param name="laser_time" value="0.4" />
+        <param name="laser_time" value="1000" />
         <!-- 激光模式：'point' 点射模式 或 'spiral' 螺旋线模式 -->
         <param name="laser_mode" value="point" />
         <!-- 螺旋线参数（仅在spiral模式下有效） -->
@@ -75,9 +75,9 @@
         <param name="spiral_angle_step" value="0.25" />  <!-- 螺旋线角度步进（弧度），控制扫描精度 -->
 
         <!-- 振镜参数 -->
-        <param name="serial_port" value="/dev/ttyACM0" />
+        <param name="serial_port" value="/dev/ttyACM1" />
         <param name="serial_baudrate" value="115200" />
-        <param name="min_move_step" value="0" />
+        <param name="min_move_step" value="200" />
 
         <!-- 图像与深度话题 -->
         <param name="image_width" value="1280" />
@@ -103,9 +103,9 @@
         <!-- 振镜区域分割方式：vertical（垂直分割，左右）或 horizontal（水平分割，上下）-->
         <param name="galvo_split_axis" value="vertical" />
         <!-- 分割比例：0.0-1.0，vertical模式下表示左振镜占图像宽度的比例，horizontal模式下表示上振镜占图像高度的比例-->
-        <param name="galvo_split_ratio" value="0.5" />
+        <param name="galvo_split_ratio" value="0.01" />
         <!-- 重叠区域像素数（两个振镜扫描区域的重叠部分，用于平滑过渡）-->
-        <param name="galvo_overlap_px" value="120" />
+        <param name="galvo_overlap_px" value="20" />
 
     </node>
 </launch>

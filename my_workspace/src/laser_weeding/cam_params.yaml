@@ -1,16 +1,20 @@
 camera_matrix:
-  fx: 609.101684570312      # 焦距x (像素)
-  fy: 607.88696289062      # 焦距y (像素)
-  cx: 316.927886962890      # 主点x (像素)
-  cy: 236.43728637695312      # 主点y (像素)
+  fx: 908.89     # 焦距x (像素)  1280*720
+  fy: 908.22     # 焦距y
+  cx: 636.29     # 主点x
+  cy: 354.21   # 主点y
+  # fx: 609.101684570312      # 焦距x (像素)
+  # fy: 607.88696289062      # 焦距y (像素)
+  # cx: 316.927886962890      # 主点x (像素)
+  # cy: 236.43728637695312      # 主点y (像素)
 
 distortion_coeffs: []  # 畸变系数 [k1, k2, p1, p2, k3]
 
 extrinsics:
   # 相机在振镜坐标系中的位置 (mm)
-  t_gc: [0.0, 100.0, 0.0]  # [右+左-, 前+后-, 上+下-]
+  t_gc: [0.0, -60.0, -45.0]  # [右+左-, 前+后-, 上+下-]
   # 相机在振镜坐标系中的姿态四元数 [x, y, z, w]
-  q_gc: [0.0, 0.0, 0.0, 1.0]  # 无旋转
+  q_gc:  [0.0, 1.0, 0.0, 0.0]  # 无旋转
 
 work_plane:
   # 工作平面法向量 (单位向量)
@@ -37,35 +41,8 @@ galvos:
         t_gc_mm: [-120.0, 100.0, 0.0]
         q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
       refined:
-        t_gc_mm: [-122.5, 102.0, 1.5]
-        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
-      active: refined
-    code_offset: [0.0, 0.0]
-    code_scale: [1.0, 1.0]
-    max_code: 32767
-    code_limits:
-      x: [-32767, 32767]
-      y: [-32767, 32767]
-    galvo_params:
-      scan_angle: 46.0
-      scan_angle_x_plus: 45.4
-      scan_angle_x_minus: 45.8
-      scan_angle_y_plus: 47.4
-      scan_angle_y_minus: 45.8
-      scale_x: 1.0
-      scale_y: 1.0
-      bias_x: 0.0
-      bias_y: 0.0
-      max_code: 32767
-
-  - name: right_head
-    extrinsics:
-      rough:
-        t_gc_mm: [120.0, 100.0, 0.0]
-        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
-      refined:
-        t_gc_mm: [118.7, 99.5, -1.2]
-        q_gc_xyzw: [0.0, 0.0, 0.0, 1.0]
+        t_gc_mm: [0.0, -60.0, -45.0]
+        q_gc_xyzw: [0.0, 1.0, 0.0, 0.0]
       active: refined
     code_offset: [0.0, 0.0]
     code_scale: [1.0, 1.0]
@@ -84,6 +61,53 @@ galvos:
       bias_x: 0.0
       bias_y: 0.0
       max_code: 32767
+    # 多项式校正（可选，标定后会自动填充）
+    # poly_correction:
+    #   description: '二阶多项式校正: Code = C0 + C1*X + C2*Y + C3*X^2 + C4*X*Y + C5*Y^2'
+    #   coefficients_x: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # [C0, C1, C2, C3, C4, C5] for X
+    #   coefficients_y: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # [C0, C1, C2, C3, C4, C5] for Y
+    #   input_units: mm
+    #   output_units: code
+    #   order: 2
+    # active_correction: extrinsics  # 'extrinsics' 或 'poly_correction'
+
+  - name: right_head
+    extrinsics:
+      rough:
+        t_gc_mm: [0.0, -60.0, -45.0]
+        q_gc_xyzw: [0.0, 1.0, 0.0, 0.0]
+      refined:
+        t_gc_mm: [17.055208651254453,-58.80502203908128,-46.29489372511125]
+        q_gc_xyzw: [0.026432760177595202,0.9995748314311734,0.006112530937851254,-0.010681878311842278]
+      active: refined
+    code_offset: [0.0, 0.0]
+    code_scale: [1.0, 1.0]
+    max_code: 32767
+    code_limits:
+      x: [-32767, 32767]
+      y: [-32767, 32767]
+    galvo_params:
+      scan_angle: 46.0
+      scan_angle_x_plus: 45.4
+      scan_angle_x_minus: 45.8
+      scan_angle_y_plus: 47.4
+      scan_angle_y_minus: 45.8
+      scale_x: 1.0
+      scale_y: 1.0
+      bias_x: 0.0
+      bias_y: 0.0
+      max_code: 32767
+    # 多项式校正（可选，标定后会自动填充）
+    poly_correction:
+       description: '二阶多项式校正: Code = C0 + C1*X + C2*Y + C3*X^2 + C4*X*Y + C5*Y^2'
+       coefficients_x: [1585.5292608018115, 191.04254043660413, 1.0238100287569325, 0.05222358534118143,
+      -0.08994436518986948, -0.036869005663781707] # [C0, C1, C2, C3, C4, C5] for X
+       coefficients_y: [-1367.563153435593, -5.616461506247173, 184.87123482878405, -0.017867622164394525,
+      0.08605902240680095, -0.09378658749906288] # [C0, C1, C2, C3, C4, C5] for Y
+       input_units: mm
+       output_units: code
+       order: 2
+    active_correction: poly_correction  # 'extrinsics' 或 'poly_correction'
 
 manual_calibration:
   enabled: true                      # 启用手工标定结果自动加载

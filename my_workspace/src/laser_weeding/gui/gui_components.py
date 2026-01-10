@@ -455,14 +455,6 @@ class ManualGalvoControlWidget(QWidget):
         title.setFont(title_font)
         layout.addWidget(title)
         
-        # 振镜选择
-        layout.addWidget(QLabel("选择振镜:"))
-        self.galvo_combo = QComboBox()
-        for i in range(self.galvo_count):
-            self.galvo_combo.addItem(f"振镜 {i+1}", i)
-        self.galvo_combo.setToolTip("选择要控制的振镜")
-        layout.addWidget(self.galvo_combo)
-        
         # 为每个振镜创建控制面板
         self.galvo_panels = []
         for i in range(self.galvo_count):
@@ -476,22 +468,25 @@ class ManualGalvoControlWidget(QWidget):
                 line.setFrameShadow(QFrame.Sunken)
                 layout.addWidget(line)
         
-        # 激光控制
-        laser_group = QGroupBox("激光控制")
-        laser_layout = QHBoxLayout()
-        
-        self.laser_on_button = QPushButton("开启激光")
-        self.laser_on_button.setToolTip("开启激光器")
-        self.laser_on_button.clicked.connect(lambda: self.on_laser_button_clicked(True))
-        laser_layout.addWidget(self.laser_on_button)
-        
-        self.laser_off_button = QPushButton("关闭激光")
-        self.laser_off_button.setToolTip("关闭激光器")
-        self.laser_off_button.clicked.connect(lambda: self.on_laser_button_clicked(False))
-        laser_layout.addWidget(self.laser_off_button)
-        
-        laser_group.setLayout(laser_layout)
-        layout.addWidget(laser_group)
+        # 为每个振镜创建独立的激光控制
+        self.laser_buttons = []
+        for galvo_idx in range(self.galvo_count):
+            laser_group = QGroupBox(f"振镜 {galvo_idx + 1} 激光控制")
+            laser_layout = QHBoxLayout()
+            
+            laser_on_btn = QPushButton("开启激光")
+            laser_on_btn.setToolTip(f"开启振镜 {galvo_idx + 1} 的激光器")
+            laser_on_btn.clicked.connect(lambda checked, idx=galvo_idx: self.on_laser_button_clicked(idx, True))
+            laser_layout.addWidget(laser_on_btn)
+            
+            laser_off_btn = QPushButton("关闭激光")
+            laser_off_btn.setToolTip(f"关闭振镜 {galvo_idx + 1} 的激光器")
+            laser_off_btn.clicked.connect(lambda checked, idx=galvo_idx: self.on_laser_button_clicked(idx, False))
+            laser_layout.addWidget(laser_off_btn)
+            
+            laser_group.setLayout(laser_layout)
+            layout.addWidget(laser_group)
+            self.laser_buttons.append((laser_on_btn, laser_off_btn))
         
         layout.addStretch()
         self.setLayout(layout)
@@ -562,9 +557,11 @@ class ManualGalvoControlWidget(QWidget):
         panel = self.galvo_panels[galvo_index]
         if axis == 'x':
             y = panel.y_spinbox.value()
+            print(f"DEBUG [GUI Component]: Emitting galvo_command: galvo_index={galvo_index}, x={value}, y={y}")
             self.galvo_command.emit(galvo_index, value, y)
         else:
             x = panel.x_spinbox.value()
+            print(f"DEBUG [GUI Component]: Emitting galvo_command: galvo_index={galvo_index}, x={x}, y={value}")
             self.galvo_command.emit(galvo_index, x, value)
     
     def on_center_clicked(self, galvo_index):
@@ -572,20 +569,18 @@ class ManualGalvoControlWidget(QWidget):
         panel = self.galvo_panels[galvo_index]
         panel.x_slider.setValue(0)
         panel.y_slider.setValue(0)
+        print(f"DEBUG [GUI Component]: Center clicked for galvo_index={galvo_index}")
         self.galvo_command.emit(galvo_index, 0, 0)
     
-    def on_laser_button_clicked(self, enabled):
+    def on_laser_button_clicked(self, galvo_index, enabled):
         """激光按钮点击回调"""
-        # 获取当前选中的振镜索引
-        galvo_index = self.galvo_combo.currentData()
-        if galvo_index is not None:
-            self.laser_control.emit(galvo_index, enabled)
+        self.laser_control.emit(galvo_index, enabled)
     
     def set_enabled(self, enabled):
         """设置控件启用状态"""
         for panel in self.galvo_panels:
             panel.setEnabled(enabled)
-        self.laser_on_button.setEnabled(enabled)
-        self.laser_off_button.setEnabled(enabled)
-        self.galvo_combo.setEnabled(enabled)
+        for laser_on_btn, laser_off_btn in self.laser_buttons:
+            laser_on_btn.setEnabled(enabled)
+            laser_off_btn.setEnabled(enabled)
 

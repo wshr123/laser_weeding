@@ -12,7 +12,7 @@
     <!-- 手动振镜校准节点 -->
     <node pkg="laser_weeding" type="galvo_calibrator_depth.py" name="manual_galvo_calibration_node" output="screen">
         <!-- 振镜串口参数 -->
-        <param name="serial_port" value="/dev/ttyACM0" />
+        <param name="serial_port" value="/dev/ttyACM2" />
         <param name="serial_baudrate" value="115200" />
 
         <!-- 坐标变换配置 -->
@@ -26,6 +26,8 @@
         <param name="galvo_index" value="1" />
         <!-- 校准结果保存 -->
         <param name="calibration_result_file" value="$(find laser_weeding)/yaml/manual_galvo_calibration.yaml" />
+        <!-- 标定方法选择: 'svd' 或 'polynomial' -->
+        <param name="calibration_method" value="polynomial" />
 
 <!--          --><!-- === 控制侧轴适配 === -->
 <!--         <param name="swap_axes" value="false" /> -->
