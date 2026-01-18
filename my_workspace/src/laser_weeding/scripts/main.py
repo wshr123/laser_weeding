@@ -1336,17 +1336,40 @@ class LaserWeedingNode:
             # 计算螺旋间距（基于半径的百分比）
             spiral_spacing = spiral_radius * self.spiral_spacing_ratio
             
-            # 配置螺旋参数
+            # 根据laser_time动态计算point_delay_us，确保螺旋线在laser_time内完成
+            # 公式推导：
+            # 螺旋线半径公式：radius = (spacing * angle) / (2 * PI)
+            # 最大角度 = (spiral_radius * 2 * PI) / spacing
+            # 总点数 = 最大角度 / angle_step
+            # 总时间（微秒）= 总点数 * point_delay_us
+            # 所以：laser_time * 1e6 = 总点数 * point_delay_us
+            # 整理得：point_delay_us = (laser_time * 1e6) / 总点数
+            if spiral_spacing > 0 and self.spiral_angle_step > 0:
+                max_angle = (spiral_radius * 2.0 * np.pi) / spiral_spacing
+                total_points = max_angle / self.spiral_angle_step
+                if total_points > 0:
+                    calculated_point_delay_us = int((self.laser_time * 1e6) / total_points)
+                    # 限制范围，确保合理（最小100微秒，最大10000微秒）
+                    calculated_point_delay_us = max(100, min(calculated_point_delay_us, 10000))
+                    point_delay_to_use = calculated_point_delay_us
+                else:
+                    point_delay_to_use = self.spiral_point_delay_us
+            else:
+                point_delay_to_use = self.spiral_point_delay_us
+            
+            # 配置螺旋参数（使用计算出的point_delay_us，确保在laser_time内完成）
             if self.galvo_controller.select_galvo(galvo_idx):
+                target_duration_ms = int(self.laser_time * 1000)  # 转换为毫秒（作为双重保护）
                 self.galvo_controller.configure_spiral(
                     radius=spiral_radius,
                     spacing=spiral_spacing,
-                    dwell_us=self.spiral_point_delay_us,
-                    angle_step=self.spiral_angle_step
+                    dwell_us=point_delay_to_use,
+                    target_duration_ms=target_duration_ms
                 )
                 x, y, w, h = bbox[0], bbox[1], bbox[2], bbox[3]
                 short_side = min(w, h)
-                rospy.logdebug(f"Galvo {galvo_idx}: 配置螺旋参数 - 半径={spiral_radius}, 间距={spiral_spacing:.1f}, bbox短边={short_side:.1f}px")
+                rospy.logdebug(f"Galvo {galvo_idx}: 配置螺旋参数 - 半径={spiral_radius}, 间距={spiral_spacing:.1f}, "
+                             f"点延迟={point_delay_to_use}us, bbox短边={short_side:.1f}px, 目标时间={self.laser_time}s")
         
         except Exception as e:
             rospy.logwarn(f"Failed to configure spiral for galvo {galvo_idx}: {e}")
@@ -1358,18 +1381,25 @@ class LaserWeedingNode:
 
             if self.galvo_controller:
                 try:
-                    # 选择对应的振镜并控制其激光
-                    if self.galvo_controller.select_galvo(galvo_idx):
-                        if enable:
-                            # 如果是螺旋模式，先根据bbox配置螺旋参数
-                            if self.laser_mode == 'spiral':
-                                self.configure_spiral_for_target(galvo_idx)
-                            
-                            self.galvo_controller.send_command("LASER:ON")
-                            rospy.logdebug(f"Galvo {galvo_idx}: 激光开启 (模式: {self.laser_mode})")
-                        else:
-                            self.galvo_controller.send_command("LASER:OFF")
-                            rospy.logdebug(f"Galvo {galvo_idx}: 激光关闭")
+                    if enable:
+                        # 1. 螺旋模式下，先配置参数 (半径、速度等)
+                        if self.laser_mode == 'spiral':
+                            self.configure_spiral_for_target(galvo_idx)
+                        
+                        # 2. 发送开火指令，并【直接附带模式参数】
+                        # 这样 Teensy 不需要依赖之前的状态，收到这条指令就会以 SPIRAL 模式开火
+                        mode_param = "SPIRAL" if self.laser_mode == 'spiral' else "POINT"
+                        
+                        # 调用修改后的 laser_on 方法
+                        self.galvo_controller.laser_on(galvo_index=galvo_idx, mode=mode_param)
+                        
+                        rospy.logdebug(f"Galvo {galvo_idx}: 激光开启 (强制模式: {mode_param})")
+                    else:
+                        # 关激光不需要带模式
+                        prefix = f"LASER{galvo_idx + 1}"
+                        self.galvo_controller.send_command(f"{prefix}:OFF")
+                        rospy.logdebug(f"Galvo {galvo_idx}: 激光关闭")
+                        
                 except Exception as e:
                     rospy.logerr(f"failed control galvo {galvo_idx} laser: {e}")
             

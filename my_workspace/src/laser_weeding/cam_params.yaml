@@ -63,12 +63,12 @@ galvos:
       max_code: 32767
     # 多项式校正（可选，标定后会自动填充）
     # poly_correction:
-    #   description: '二阶多项式校正: Code = C0 + C1*X + C2*Y + C3*X^2 + C4*X*Y + C5*Y^2'
-    #   coefficients_x: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # [C0, C1, C2, C3, C4, C5] for X
-    #   coefficients_y: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # [C0, C1, C2, C3, C4, C5] for Y
+    #   description: '三阶多项式校正: Code = C0 + C1*X + C2*Y + C3*X^2 + C4*X*Y + C5*Y^2 + C6*X^3 + C7*X^2*Y + C8*X*Y^2 + C9*Y^3'
+    #   coefficients_x: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # [C0, C1, C2, C3, C4, C5, C6, C7, C8, C9] for X
+    #   coefficients_y: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # [C0, C1, C2, C3, C4, C5, C6, C7, C8, C9] for Y
     #   input_units: mm
     #   output_units: code
-    #   order: 2
+    #   order: 3
     # active_correction: extrinsics  # 'extrinsics' 或 'poly_correction'
 
   - name: right_head
@@ -77,8 +77,8 @@ galvos:
         t_gc_mm: [0.0, -60.0, -45.0]
         q_gc_xyzw: [0.0, 1.0, 0.0, 0.0]
       refined:
-        t_gc_mm: [17.055208651254453,-58.80502203908128,-46.29489372511125]
-        q_gc_xyzw: [0.026432760177595202,0.9995748314311734,0.006112530937851254,-0.010681878311842278]
+        t_gc_mm: [0.0, -60.0, -45.0]
+        q_gc_xyzw: [0.0, 1.0, 0.0, 0.0]
       active: refined
     code_offset: [0.0, 0.0]
     code_scale: [1.0, 1.0]
@@ -100,14 +100,14 @@ galvos:
     # 多项式校正（可选，标定后会自动填充）
     poly_correction:
        description: '二阶多项式校正: Code = C0 + C1*X + C2*Y + C3*X^2 + C4*X*Y + C5*Y^2'
-       coefficients_x: [1585.5292608018115, 191.04254043660413, 1.0238100287569325, 0.05222358534118143,
-      -0.08994436518986948, -0.036869005663781707] # [C0, C1, C2, C3, C4, C5] for X
-       coefficients_y: [-1367.563153435593, -5.616461506247173, 184.87123482878405, -0.017867622164394525,
-      0.08605902240680095, -0.09378658749906288] # [C0, C1, C2, C3, C4, C5] for Y
+       coefficients_x: [2361.92473609284, 200.9323771452125, 3.5617570370845697, -0.013702929678430564,
+      -0.06442544221398094, -0.035262207156904424] # [C0, C1, C2, C3, C4, C5] for X
+       coefficients_y: [-689.6025572314381, -3.30973818076834, 199.52433504693605, -0.007435184938754613,
+      0.0029135487584883712, -0.0770500712597384] # [C0, C1, C2, C3, C4, C5] for Y
        input_units: mm
        output_units: code
        order: 2
-    active_correction: poly_correction  # 'extrinsics' 或 'poly_correction'
+    active_correction: extrinsics  # 'extrinsics' 或 'poly_correction'
 
 manual_calibration:
   enabled: true                      # 启用手工标定结果自动加载

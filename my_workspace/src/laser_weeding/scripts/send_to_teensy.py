@@ -3,7 +3,6 @@
 
 import serial
 import time
-import os
 from typing import List, Optional, Tuple
 
 import rospy
@@ -48,24 +47,6 @@ class XY2_100Controller:
 
     def connect(self):
         """连接到Teensy"""
-        # 检查设备是否存在
-        if not os.path.exists(self.port):
-            rospy.logerr(f"串口设备不存在: {self.port}")
-            rospy.logerr(f"请检查: 1) 设备是否连接 2) 设备路径是否正确")
-            rospy.logerr(f"可用设备列表: {self._list_available_ports()}")
-            self.serial_port = None
-            self.connected = False
-            return
-        
-        # 检查权限
-        if not os.access(self.port, os.R_OK | os.W_OK):
-            rospy.logerr(f"没有访问权限: {self.port}")
-            rospy.logerr(f"请运行: sudo usermod -a -G dialout $USER")
-            rospy.logerr(f"然后重新登录或运行: newgrp dialout")
-            self.serial_port = None
-            self.connected = False
-            return
-        
         try:
             self.serial_port = serial.Serial(
                 port=self.port,
@@ -90,23 +71,8 @@ class XY2_100Controller:
             self.connected = True
 
         except serial.SerialException as e:
-            error_msg = str(e)
-            if "could not open port" in error_msg.lower() or "permission denied" in error_msg.lower():
-                rospy.logerr(f"无法打开串口 {self.port}: {e}")
-                rospy.logerr(f"可能原因: 1) 权限不足 (运行: sudo usermod -a -G dialout $USER)")
-                rospy.logerr(f"2) 设备被占用 (检查: lsof {self.port})")
-            elif "device reports readiness" in error_msg.lower():
-                rospy.logwarn(f"设备就绪检查失败，但继续尝试: {e}")
-                # 继续尝试，有时这个警告可以忽略
-                self.connected = True
-            else:
-                rospy.logerr(f"Failed to connect to {self.port}: {e}")
-            if not self.connected:
-                self.serial_port = None
-        except Exception as e:
-            rospy.logerr(f"Unexpected error connecting to {self.port}: {e}")
+            rospy.logerr(f"Failed to connect to {self.port}: {e}")
             self.serial_port = None
-            self.connected = False
 
     def is_connected(self):
         """检查连接状态"""
@@ -135,14 +101,6 @@ class XY2_100Controller:
             rospy.logdebug(f"Serial port not connected, command: {command}")
             return False
 
-        # 检查串口是否仍然打开
-        if not self.serial_port.is_open:
-            rospy.logerr(f"Serial port {self.port} is not open. Attempting to reconnect...")
-            self.connect()
-            if not self.serial_port or not self.serial_port.is_open:
-                rospy.logerr(f"Failed to reconnect to {self.port}")
-                return False
-
         try:
             command_bytes = (command + '\n').encode('utf-8')
             self.serial_port.write(command_bytes)
@@ -150,17 +108,6 @@ class XY2_100Controller:
             rospy.logdebug(f"Sent command: {command}")
             return True
 
-        except serial.SerialException as e:
-            error_msg = str(e)
-            if "Input/output error" in error_msg or "[Errno 5]" in error_msg:
-                rospy.logerr(f"串口I/O错误 (可能原因: 设备未连接/断开/权限不足): {self.port}")
-                rospy.logerr(f"请检查: 1) 设备是否连接 2) 权限是否正确 (sudo usermod -a -G dialout $USER)")
-                rospy.logerr(f"3) 设备是否被其他程序占用 (lsof {self.port})")
-            else:
-                rospy.logerr(f"串口通信错误: {e}")
-            # 标记为未连接，下次尝试重连
-            self.connected = False
-            return False
         except Exception as e:
             rospy.logerr(f"Failed to send command: {e}")
             return False
@@ -182,8 +129,6 @@ class XY2_100Controller:
 
     def move_to_position(self, x: int, y: int, galvo_index: Optional[int] = None):
         """移动振镜到指定位置 (支持0-65535和有符号格式)。"""
-        # 保存原始 galvo_index（在 sanitize 之前）
-        original_index = galvo_index
         galvo_index = self._sanitize_galvo_index(galvo_index)
 
         limits = self.galvo_limits[galvo_index]
@@ -193,30 +138,45 @@ class XY2_100Controller:
         x = int(max(x_min, min(x_max, int(x))))
         y = int(max(y_min, min(y_max, int(y))))
 
-        # 使用 XY{galvo_index + 1}: 格式直接指定振镜
-        # Arduino 代码会从命令中提取数字并解析为 galvo_index
-        # galvo_index: 0 -> XY1: -> Arduino解析为 target_galvo=0
-        # galvo_index: 1 -> XY2: -> Arduino解析为 target_galvo=1
-        # 注意：不要先调用 select_galvo，因为 XY1:/XY2: 格式已经明确指定了振镜
-        prefix = f"XY{galvo_index + 1}"
+        prefix = f"XY{galvo_index + 1}" if galvo_index is not None else "XY"
         command = f"{prefix}:{x},{y}"
 
         if self.send_command(command):
             self.current_positions[galvo_index] = [x, y]
-            # 更新 _active_galvo 以保持状态一致
-            self._active_galvo = galvo_index
-            # 调试级别输出，避免在正常运行时刷屏
-            rospy.logdebug(f"[Hardware] Sent command: '{command}', galvo_index={galvo_index}, x={x}, y={y}")
 
     def move_to_center(self, galvo_index: Optional[int] = None):
         """移动到中心位置。"""
         galvo_index = self._sanitize_galvo_index(galvo_index)
         self.move_to_position(0, 0, galvo_index=galvo_index)
 
-    def laser_on(self):
-        """打开激光"""
-        command = "LASER:ON"
+    def laser_on(self, galvo_index: int = None, mode: str = None):
+        """
+        打开激光。
+        
+        :param galvo_index: 指定振镜索引
+        :param mode: 强制指定模式 'SPIRAL' 或 'POINT'，为 None 则使用默认
+        """
+        # 如果指定了 index，先选择或者直接拼装 LASERn
+        prefix = "LASER"
+        if galvo_index is not None:
+            # 确保索引合法
+            if 0 <= galvo_index < self.galvo_count:
+                prefix = f"LASER{galvo_index + 1}"
+            else:
+                rospy.logwarn(f"Invalid galvo index {galvo_index}")
+                return
+        
+        command = f"{prefix}:ON"
+        
+        # 如果指定了模式，追加到指令末尾
+        if mode:
+            command += f":{mode.upper()}"
+            
         if self.send_command(command):
+            # 更新本地状态 (如果有对应索引)
+            if galvo_index is not None and 0 <= galvo_index < self.galvo_count:
+                # 这里可以维护一个列表记录每个振镜的状态，暂时简单处理
+                pass
             self.laser_enabled = True
 
     def laser_off(self):
@@ -266,9 +226,19 @@ class XY2_100Controller:
             return False
         return self.send_command(f"MODE:{mode_upper}")
 
-    def configure_spiral(self, radius: int, spacing: float, dwell_us: int, angle_step: float = 0.25) -> bool:
-        """配置螺旋灼烧参数。"""
-        command = f"SPIRAL:CONFIG:{radius},{spacing},{dwell_us},{angle_step}"
+    def configure_spiral(self, radius: int, spacing: float, dwell_us: int, target_duration_ms: int = 200) -> bool:
+        """
+        配置螺旋灼烧参数。
+        
+        参数:
+            radius: 螺旋线最大半径（振镜代码值）
+            spacing: 螺旋线间距（振镜代码值）
+            dwell_us: 螺旋线点间延迟（微秒）
+            target_duration_ms: 螺旋线目标持续时间（毫秒），默认200ms
+        
+        注意：下位机不支持通过命令配置angle_step，它使用固定值0.25弧度
+        """
+        command = f"SPIRAL:CONFIG:{radius},{spacing},{dwell_us},{target_duration_ms}"
         return self.send_command(command)
 
     def close(self):
@@ -346,14 +316,3 @@ class XY2_100Controller:
             return self._active_galvo
 
         return galvo_index
-    
-    def _list_available_ports(self) -> List[str]:
-        """列出可用的串口设备"""
-        import serial.tools.list_ports
-        try:
-            ports = serial.tools.list_ports.comports()
-            return [port.device for port in ports]
-        except Exception:
-            # 如果无法列出，返回常见的设备路径
-            common_ports = ['/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0', '/dev/ttyUSB1']
-            return [p for p in common_ports if os.path.exists(p)]

@@ -9,8 +9,9 @@
         <param name="depth_height" value="720"/>
         <param name="fps"          value="30"/>
     </node>
-    <!-- 手动振镜校准节点 -->
-    <node pkg="laser_weeding" type="galvo_calibrator_depth.py" name="manual_galvo_calibration_node" output="screen">
+    <!-- 手动振镜校准节点（支持激光脉冲控制） -->
+
+    <node pkg="laser_weeding" type="galvo_calibrator_laser.py" name="manual_galvo_calibration_node" output="screen">
         <!-- 振镜串口参数 -->
         <param name="serial_port" value="/dev/ttyACM1" />
         <param name="serial_baudrate" value="115200" />
@@ -24,20 +25,17 @@
         <param name="image_height" value="720" />
         <param name="image_topic" value="'/camera/color/image_raw'" />
         <param name="galvo_index" value="1" />
+        
         <!-- 校准结果保存 -->
         <param name="calibration_result_file" value="$(find laser_weeding)/yaml/manual_galvo_calibration.yaml" />
+        
         <!-- 标定方法选择: 'svd' 或 'polynomial' -->
         <param name="calibration_method" value="polynomial" />
-
-<!--          --><!-- === 控制侧轴适配 === -->
-<!--         <param name="swap_axes" value="false" /> -->
-<!--         <param name="invert_x"  value="false" /> -->
-<!--         <param name="invert_y"  value="false" /> -->
-
-<!--          --><!-- === 仅可视化叠加的适配 === -->
-<!--         <param name="visual_swap_axes" value="false" /> -->
-<!--         <param name="visual_invert_x"  value="false" /> -->
-<!--         <param name="visual_invert_y"  value="false" /> -->
+        
+        <!-- 激光脉冲控制参数（防止标定板烧坏） -->
+        <param name="laser_pulse_enabled" value="true" />  <!-- 启用激光脉冲模式 -->
+        <param name="laser_total_time" value="1.0" />      <!-- 总照射时间（秒） -->
+        <param name="laser_pulse_period" value="0.04" />   <!-- 脉冲周期（秒），例如0.04表示0.02秒开+0.02秒关 -->
 
     </node>
 

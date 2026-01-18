@@ -519,9 +519,10 @@ class CameraGalvoTransform:
             else:
                 # SVD方法：使用refined extrinsics（当前外参，已在set_active_galvo_profile中更新）
                 p_g = self.R_gc @ p_c_mm + self.t_gc
+                # print(p_g)
 
             # 应用fix extrinsics（如果配置了）
-            p_g = self.q_fix @ p_g + self.t_fix
+            # p_g = self.q_fix @ p_g + self.t_fix
             
             return p_g
         except Exception:
@@ -625,7 +626,7 @@ class CameraGalvoTransform:
                         # rospy.logwarn_throttle(1.0, "Depth dropout! Holding last valid depth.")
                         current_depth_m = self.last_valid_depth_m
                 # --------------------
-            current_depth_m  = 0.31
+            # current_depth_m  = 0.31
             # 2. 如果最终要到了深度 (无论是当前的还是历史的)
             if current_depth_m is not None and current_depth_m > 0:
                 # print("pixel_x,pixel_y", pixel_x, pixel_y)
@@ -777,18 +778,42 @@ class CameraGalvoTransform:
 
 
     def codes_to_angles(self, code_x, code_y):
-
+        """
+        振镜编码转角度，与 angles_to_codes 保持一致的逻辑
+        使用不对称角度参数（scan_angle_x_plus, scan_angle_x_minus, scan_angle_y_plus, scan_angle_y_minus）
+        """
         galvo = self.params['galvo_params']
         max_code = galvo['max_code']
 
         norm_x = code_x / max_code
         norm_y = code_y / max_code
 
-        half_scan_angle = galvo['scan_angle'] / 2.0  # deg
+        # 使用不对称角度参数（与 angles_to_codes 保持一致）
+        # 对于 X 轴
+        if norm_x >= 0:
+            # 正向：code_x = theta_x_corrected / scan_angle_x_plus * 2.0 * max_code
+            # 反向：theta_x_corrected = norm_x * scan_angle_x_plus / 2.0
+            scan_angle_x = galvo.get('scan_angle_x_plus', galvo['scan_angle'] / 2.0)
+            theta_x_corrected = norm_x * scan_angle_x / 2.0
+        else:
+            # 负向：code_x = theta_x_corrected / (scan_angle_x_minus / 2.0) * max_code
+            # 反向：theta_x_corrected = norm_x * scan_angle_x_minus / 2.0
+            scan_angle_x = galvo.get('scan_angle_x_minus', galvo['scan_angle'] / 2.0)
+            theta_x_corrected = norm_x * scan_angle_x / 2.0
 
-        theta_x_corrected = norm_x * half_scan_angle
-        theta_y_corrected = norm_y * half_scan_angle
+        # 对于 Y 轴
+        if norm_y >= 0:
+            # 正向：code_y = theta_y_corrected / scan_angle_y_plus * 2.0 * max_code
+            # 反向：theta_y_corrected = norm_y * scan_angle_y_plus / 2.0
+            scan_angle_y = galvo.get('scan_angle_y_plus', galvo['scan_angle'] / 2.0)
+            theta_y_corrected = norm_y * scan_angle_y / 2.0
+        else:
+            # 负向：code_y = theta_y_corrected / scan_angle_y_minus * 2.0 * max_code
+            # 反向：theta_y_corrected = norm_y * scan_angle_y_minus / 2.0
+            scan_angle_y = galvo.get('scan_angle_y_minus', galvo['scan_angle'] / 2.0)
+            theta_y_corrected = norm_y * scan_angle_y / 2.0
 
+        # 应用反向修正（去除 scale 和 bias）
         theta_x_deg = (theta_x_corrected - galvo['bias_x']) / galvo['scale_x']
         theta_y_deg = (theta_y_corrected - galvo['bias_y']) / galvo['scale_y']
 

@@ -65,9 +65,9 @@
 
         <!-- 激光控制 -->
         <param name="aiming_time" value="0.15" />
-        <param name="laser_time" value="1000" />
+        <param name="laser_time" value="3.0" />  <!-- 单位：秒 -->
         <!-- 激光模式：'point' 点射模式 或 'spiral' 螺旋线模式 -->
-        <param name="laser_mode" value="point" />
+        <param name="laser_mode" value="spiral" />
         <!-- 螺旋线参数（仅在spiral模式下有效） -->
         <param name="spiral_diameter_mm" value="20.0" />  <!-- 螺旋线直径（毫米），默认2cm，会根据深度自动调整半径 -->
         <param name="spiral_spacing_ratio" value="0.1" />  <!-- 螺旋线间距与半径的比值，默认0.1（即间距为半径的10%） -->
@@ -105,7 +105,7 @@
         <!-- 分割比例：0.0-1.0，vertical模式下表示左振镜占图像宽度的比例，horizontal模式下表示上振镜占图像高度的比例-->
         <param name="galvo_split_ratio" value="0.01" />
         <!-- 重叠区域像素数（两个振镜扫描区域的重叠部分，用于平滑过渡）-->
-        <param name="galvo_overlap_px" value="20" />
+        <param name="galvo_overlap_px" value="0" />
 
     </node>
 </launch>
