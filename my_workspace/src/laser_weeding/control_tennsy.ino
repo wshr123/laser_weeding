@@ -1,6 +1,3 @@
-// 简化版 Teensy 3.2 振镜控制器 - V2.4 
-// 修复：自动切换活动振镜 + 增加端口互换开关 + 还原Code1逻辑
-
 #if !defined(__has_include)
 #define __has_include(x) 0
 #endif
@@ -26,7 +23,11 @@ const int LASER_PINS[GALVO_COUNT] = {3, 4};
 const bool SWAP_HARDWARE_PORTS = false; 
 
 // ==========================================
+<<<<<<< HEAD
 //              全局变量
+=======
+//               全局变量
+>>>>>>> ccfcea0209b2e31744988083664d289e28221df7
 // ==========================================
 enum LaserMode {
   LASER_MODE_POINT = 0,
@@ -111,6 +112,10 @@ void setup() {
   Serial.println("=====================================");
   Serial.println("  Teensy Galvo Controller V2.4");
   Serial.println("  Feature: Auto-Switch Active Galvo");
+<<<<<<< HEAD
+=======
+  Serial.println("  Feature: Spiral Overflow Fix");
+>>>>>>> ccfcea0209b2e31744988083664d289e28221df7
   Serial.println("=====================================");
 
   for (uint8_t i = 0; i < GALVO_COUNT; i++) {
@@ -200,7 +205,11 @@ void loop() {
 }
 
 // ==========================================
+<<<<<<< HEAD
 //              核心：螺旋叠加
+=======
+//              核心：螺旋叠加 (修复溢出版)
+>>>>>>> ccfcea0209b2e31744988083664d289e28221df7
 // ==========================================
 void processSpiral(uint8_t i) {
   unsigned long now = micros();
@@ -220,16 +229,25 @@ void processSpiral(uint8_t i) {
 
   float radius = (max(10.0f, spiral_spacing) * spiral_current_angle[i]) / (2.0f * PI);
 
+<<<<<<< HEAD
   // 如果达到最大半径，也停止（双重保护）
+=======
+  // 如果达到最大半径，也停止
+>>>>>>> ccfcea0209b2e31744988083664d289e28221df7
   if (radius > spiral_max_radius) {
     setLaser(i, false);
     is_spiraling[i] = false;
     hold_center[i] = false; 
+<<<<<<< HEAD
     sendToGalvo(i, base_x[i], base_y[i]); // 归位到当前的基座位置
+=======
+    sendToGalvo(i, base_x[i], base_y[i]); 
+>>>>>>> ccfcea0209b2e31744988083664d289e28221df7
     Serial.println("INFO:G" + String(i+1) + ":SPIRAL_DONE");
     return;
   }
 
+<<<<<<< HEAD
   int16_t offset_x = int16_t(radius * cos(spiral_current_angle[i]));
   int16_t offset_y = int16_t(radius * sin(spiral_current_angle[i]));
 
@@ -238,6 +256,33 @@ void processSpiral(uint8_t i) {
   int16_t final_y = base_y[i] + offset_y;
 
   sendToGalvo(i, final_x, final_y);
+=======
+  // --- 修复溢出开始 ---
+  // 1. 使用 long 计算偏移量，防止溢出
+  long offset_x = (long)(radius * cos(spiral_current_angle[i]));
+  long offset_y = (long)(radius * sin(spiral_current_angle[i]));
+
+  // 2. 计算最终坐标 (使用 long)
+  long calc_x = (long)base_x[i] + offset_x;
+  long calc_y = (long)base_y[i] + offset_y;
+
+  // 3. 获取当前振镜的物理限制
+  int16_t x_min = x_min_limits[i];
+  int16_t x_max = x_max_limits[i];
+  int16_t y_min = y_min_limits[i];
+  int16_t y_max = y_max_limits[i];
+
+  // 4. 手动限幅 (Clamp) - 关键步骤：防止溢出回绕
+  if (calc_x > x_max) calc_x = x_max;
+  if (calc_x < x_min) calc_x = x_min;
+  if (calc_y > y_max) calc_y = y_max;
+  if (calc_y < y_min) calc_y = y_min;
+
+  // 5. 安全转换为 int16_t 并发送
+  sendToGalvo(i, (int16_t)calc_x, (int16_t)calc_y);
+  // --- 修复溢出结束 ---
+
+>>>>>>> ccfcea0209b2e31744988083664d289e28221df7
   spiral_current_angle[i] += spiral_angle_step;
 }
 
@@ -450,6 +495,7 @@ void parseCommand(String cmd) {
       }
       sendResponse("OK:SPIRAL_CONFIG");
     }
+<<<<<<< HEAD
   }
   else if (cmd.startsWith("GALVO:")) {
     int idx = cmd.substring(6).toInt() - 1;
@@ -459,3 +505,14 @@ void parseCommand(String cmd) {
     }
   }
 }
+=======
+  }
+  else if (cmd.startsWith("GALVO:")) {
+    int idx = cmd.substring(6).toInt() - 1;
+    if (idx >= 0 && idx < GALVO_COUNT) {
+      active_galvo = idx;
+      sendResponse("OK:GALVO:" + String(idx+1));
+    }
+  }
+}
+>>>>>>> ccfcea0209b2e31744988083664d289e28221df7
